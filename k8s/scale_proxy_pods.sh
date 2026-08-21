@@ -1680,8 +1680,12 @@ cat \$myproc >> \$LOG;
 case \$cs_path in ""|/) echo REFUSE_root_cpuset_src >> \$LOG; cs_path= ;; esac;
 case \$cpu_path in ""|/) echo REFUSE_root_cpu_src >> \$LOG; cpu_path= ;; esac;
 mvto() { s=\$1; d=\$2; if [ ! -f "\$s/cgroup.procs" ]; then echo missing_src=\$s >> \$LOG; return 0; fi; if [ ! -f "\$d/cgroup.procs" ]; then echo missing_dst=\$d >> \$LOG; return 0; fi; for p in \`cat "\$s/cgroup.procs" 2>/dev/null\`; do hostcg "echo \$p > \$d/cgroup.procs" && echo moved \$p to \$d >> \$LOG || echo move_fail \$p to \$d >> \$LOG; done; };
-migrate() { if [ -n "\$cs_path" ]; then mvto "\$CS\$cs_path" "\$PIN"; fi; if [ -n "\$cpu_path" ]; then mvto "\$CPU\$cpu_path" "\$QDIR"; fi; if [ -d /var/sankuai/hulk/one-cpu-config ]; then mvto /var/sankuai/hulk/one-cpu-config "\$QDIR"; fi; };
+TASKSET=; if command -v taskset >/dev/null 2>&1; then TASKSET=\`command -v taskset\`; fi;
+echo TASKSET=\$TASKSET >> \$LOG;
+reaff() { if [ -z "\$TASKSET" ]; then return 0; fi; for p in \`cat "\$PIN/cgroup.procs" 2>/dev/null\`; do cur=\`\$TASKSET -cp \$p 2>/dev/null | cut -d: -f2 | tr -d " "\`; if [ -n "\$cur" ] && [ "\$cur" != "\$root_cpus" ]; then \$TASKSET -acp \$root_cpus \$p >/dev/null 2>&1 && echo reaff \$p from \$cur >> \$LOG || echo reaff_fail \$p >> \$LOG; fi; done; };
+migrate() { if [ -n "\$cs_path" ]; then mvto "\$CS\$cs_path" "\$PIN"; fi; if [ -n "\$cpu_path" ]; then mvto "\$CPU\$cpu_path" "\$QDIR"; fi; if [ -d /var/sankuai/hulk/one-cpu-config ]; then mvto /var/sankuai/hulk/one-cpu-config "\$QDIR"; fi; reaff; };
 migrate;
+if [ -n "\$TASKSET" ]; then echo affinity_after=\$(\$TASKSET -cp \$\$ 2>&1) >> \$LOG; fi;
 ls -l \$PIN \$QDIR >> \$LOG 2>&1;
 echo CG_SETUP_DONE >> \$LOG;
 ( while true; do migrate; sleep 2; done ) &
@@ -1809,9 +1813,9 @@ host_start_mqs_cgroup_keeper() {
   # keeper 必须能看到本脚本的函数；把迁移逻辑写成独立脚本更稳
   nohup bash -c '
     pin=/sys/fs/cgroup/cpuset/mqs_full_cpuset
-    cpu_root=/sys/fs/cgroup/cpu
     while true; do
       if [[ -f $pin/cgroup.procs ]]; then
+        allcpus=$(cat $pin/cpuset.cpus 2>/dev/null)
         for cg in /sys/fs/cgroup/cpuset/kubepods.slice /sys/fs/cgroup/cpuset/kubepods; do
           [[ -d $cg ]] || continue
           find "$cg" -name cgroup.procs -type f 2>/dev/null | while read -r f; do
@@ -1824,6 +1828,15 @@ host_start_mqs_cgroup_keeper() {
             done < "$f"
           done
         done
+        # 迁进 cpuset 只在 attach 那一刻重置 affinity；Hulk 之后再调
+        # sched_setaffinity 就又会把进程钉回 16 核，所以要持续纠正
+        if [[ -n $allcpus ]]; then
+          while read -r p; do
+            [[ -n $p && -d /proc/$p ]] || continue
+            cur=$(taskset -cp "$p" 2>/dev/null | cut -d: -f2 | tr -d " ")
+            [[ -n $cur && $cur != "$allcpus" ]] && taskset -acp "$allcpus" "$p" >/dev/null 2>&1
+          done < $pin/cgroup.procs
+        fi
       fi
       sleep 2
     done
