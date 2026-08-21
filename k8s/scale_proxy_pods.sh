@@ -18,18 +18,23 @@
 #              不注入 HULK_CPUSET/HULK_NUMA_NODE。app requests.cpu=limits.cpu=N（整数）。
 #              不要再用 15900m Burstable：kubelet 的 CFS quota 会被 Hulk 绕开，实际会超 N 核。
 #              做法（cgroup v1，各控制器独立，内存/pids 仍留在 kubelet 的 cgroup）：
-#              1) hostPath 挂载宿主机 /sys/fs/cgroup -> /host-cgroup
-#              2) 在 kubelet 不会管的树上建自定义 cgroup（与 kubepods 同级，不是容器 cgroup 的子目录，
+#              1) 分别 hostPath 挂载 /sys/fs/cgroup/cpuset 和 /sys/fs/cgroup/cpu
+#                 （不能挂整棵 /sys/fs/cgroup：cgroup v1 子控制器是独立 mount，非递归 bind）
+#              2) hostPID=true + 宿主机 nsenter 进入宿主机 cgroup namespace。
+#                 容器默认在 private cgroup ns 里，mkdir 无法在 kubepods 旁边建同级 cgroup
+#                 （EPERM，宿主机看不到 mqs_full_cpuset）。
+#              3) 在 kubelet 不会管的树上建自定义 cgroup（与 kubepods 同级，不是容器 cgroup 的子目录，
 #                 否则 parent 已被独占绑核，子 cgroup 无法扩成 0-255）：
 #                   mkdir /host-cgroup/cpuset/mqs_full_cpuset
 #                   echo "<online>" > cpuset.cpus
 #                   echo "<node online>" > cpuset.mems
 #                   mkdir /host-cgroup/cpu/mqs_quota_<pod>
 #                   echo N*100000 > cpu.cfs_quota_us
-#              3) 把 kubelet 容器 cgroup 里的 host PID 迁到上述自定义 cgroup
+#              4) 把 kubelet 容器 cgroup 里的 host PID 迁到上述自定义 cgroup
 #                 （echo $pid > cgroup.procs）；后台循环防止 kubelet/Hulk 把进程迁回去
-#              4) 同步 HULK_CORE/HULK_CORE_NUM=N
-#              5) JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=N（无 event_loop 时）
+#              5) 本机 root 也会预创建 mqs_full_cpuset，并在 Ready 后把本机 proxy 进程再迁一次
+#              6) 同步 HULK_CORE/HULK_CORE_NUM=N
+#              7) JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=N（无 event_loop 时）
 #              内存不做节点绑定，由 memory cgroup 限制 resources.limits.memory=32Gi。
 #   有 NUMA 时：省略 cpu_com → 自动设为整 NUMA 核数（从本机 OS 实时读取，
 #              SMT on 时常为 32，SMT off 时常为 16；勿写死）
@@ -1467,6 +1472,7 @@ ensure_one_hostpath_on_app() {
   local vol_name="$2"
   local host_path="$3"
   local mount_path="$4"
+  local hp_type="${5:-Directory}"
   local tmp_file="${yaml_file}.hostcg.tmp"
   local has_vol=0
 
@@ -1550,13 +1556,13 @@ ensure_one_hostpath_on_app() {
   fi
 
   if grep -q "^  volumes:[[:space:]]*$" "$yaml_file" 2>/dev/null; then
-    awk -v vol="$vol_name" -v hpath="$host_path" '
+    awk -v vol="$vol_name" -v hpath="$host_path" -v hptype="$hp_type" '
       /^  volumes:[[:space:]]*$/ { in_vol=1; print; next }
       in_vol && /^  [a-zA-Z]/ && !/^  - / {
         print "  - name: " vol
         print "    hostPath:"
         print "      path: " hpath
-        print "      type: Directory"
+        print "      type: " hptype
         in_vol=0
         print
         next
@@ -1567,7 +1573,7 @@ ensure_one_hostpath_on_app() {
           print "  - name: " vol
           print "    hostPath:"
           print "      path: " hpath
-          print "      type: Directory"
+          print "      type: " hptype
         }
       }
     ' "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
@@ -1577,20 +1583,44 @@ ensure_one_hostpath_on_app() {
   - name: ${vol_name}
     hostPath:
       path: ${host_path}
-      type: Directory
+      type: ${hp_type}
 EOF
   fi
 }
 
+# 容器默认在 private cgroup namespace 里：即使 hostPath 挂了宿主机 cpuset 控制器，
+# mkdir 同级于 kubepods 的 cgroup 也会 EPERM，宿主机看不到新目录。
+# hostPID=true 后 PID 1 是宿主机 systemd，可用 nsenter -C 进入宿主机 cgroup ns。
+ensure_pod_host_pid() {
+  local yaml_file="$1"
+  local tmp_file="${yaml_file}.hostpid.tmp"
+  if grep -qE '^[[:space:]]*hostPID:' "$yaml_file"; then
+    sed -i -E 's/^[[:space:]]*hostPID:.*/  hostPID: true/' "$yaml_file"
+    return 0
+  fi
+  awk '
+    /^spec:[[:space:]]*$/ { print; print "  hostPID: true"; next }
+    { print }
+  ' "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
+}
+
 ensure_app_host_cgroup_mounts() {
   local yaml_file="$1"
+  local nsenter_host="/usr/bin/nsenter"
+  ensure_pod_host_pid "$yaml_file"
   ensure_one_hostpath_on_app "$yaml_file" "host-cgroup-cpuset" "/sys/fs/cgroup/cpuset" "/host-cgroup/cpuset"
   ensure_one_hostpath_on_app "$yaml_file" "host-cgroup-cpu" "/sys/fs/cgroup/cpu" "/host-cgroup/cpu"
+  # 镜像里通常没有 nsenter；从宿主机挂进来（hostPID 下 -t 1 才是 systemd）
+  if [[ ! -x "$nsenter_host" && -x /bin/nsenter ]]; then
+    nsenter_host="/bin/nsenter"
+  fi
+  ensure_one_hostpath_on_app "$yaml_file" "host-nsenter" "$nsenter_host" "/host-nsenter" "File"
 }
 
 # wrap 不得含单引号（YAML args 用单引号包一层）。
 # 无 NUMA：在宿主机 cgroup 树上建 kubelet 不会碰的自定义 cpuset/cpu cgroup，
 # 把 kubepods 里的进程迁过去。cgroup v1 各控制器独立，memory/pids 仍由 k8s 管。
+# mkdir/写 procs 必须在宿主机 cgroup ns 里做（nsenter -t 1 -C），否则 EPERM。
 # 本函数以 & 结尾；调用方必须用空格拼接后续命令，禁止 "; mkdir"（&; 会 CrashLoop）。
 # 过程写到 /opt/logs/mqs/cgroup-setup.log，mkdir 失败不再静默。
 cpu_quota_shell_cmd() {
@@ -1599,8 +1629,25 @@ cpu_quota_shell_cmd() {
 quota=${q};
 LOG=/opt/logs/mqs/cgroup-setup.log;
 mkdir -p /opt/logs/mqs; echo CG_SETUP_BEGIN \$(date) > \$LOG;
+echo pid1_comm=\$(cat /proc/1/comm 2>/dev/null) >> \$LOG;
+echo pid1_exe=\$(ls -l /proc/1/exe 2>&1) >> \$LOG;
+echo self_cgroup_ns=\$(readlink /proc/self/ns/cgroup 2>&1) >> \$LOG;
+echo pid1_cgroup_ns=\$(readlink /proc/1/ns/cgroup 2>&1) >> \$LOG;
+NSENTER=;
+if [ -x /host-nsenter ]; then NSENTER=/host-nsenter; fi;
+if [ -z "\$NSENTER" ] && command -v nsenter >/dev/null 2>&1; then NSENTER=\`command -v nsenter\`; fi;
+echo NSENTER=\$NSENTER >> \$LOG;
+hostcg() {
+  if [ -n "\$NSENTER" ] && [ -e /proc/1/ns/cgroup ]; then
+    \$NSENTER -t 1 -C -- /bin/sh -c "\$1"
+  else
+    echo nsenter_unavailable >> \$LOG
+    /bin/sh -c "\$1"
+  fi
+};
 HC=/host-cgroup;
 echo ls_host_cgroup=\$(ls -ld \$HC 2>&1) >> \$LOG;
+echo ls_cpuset=\$(ls \$HC/cpuset 2>&1 | tr "\\n" ,) >> \$LOG;
 CS=\$HC/cpuset;
 if [ ! -f "\$CS/cgroup.procs" ]; then echo FALLBACK_cpuset_not_cgroup >> \$LOG; CS=/sys/fs/cgroup/cpuset; fi;
 CPU=\$HC/cpu;
@@ -1609,28 +1656,168 @@ if [ ! -f "\$CPU/cgroup.procs" ]; then CPU=/sys/fs/cgroup/cpu; fi;
 PIN=\$CS/mqs_full_cpuset;
 QDIR=\$CPU/mqs_quota_\$HOSTNAME;
 echo CS=\$CS CPU=\$CPU PIN=\$PIN QDIR=\$QDIR >> \$LOG;
-mkdir -p "\$PIN"; echo mkdir_pin_rc=\$? >> \$LOG;
-mkdir -p "\$QDIR"; echo mkdir_quota_rc=\$? >> \$LOG;
+hostcg "mkdir -p \$PIN; mkdir -p \$QDIR";
+echo after_mkdir=\$(ls -ld \$PIN \$QDIR 2>&1 | tr "\\n" ,) >> \$LOG;
 root_cpus=\`cat "\$CS/cpuset.cpus" 2>/dev/null || cat /sys/devices/system/cpu/online\`;
 root_mems=\`cat "\$CS/cpuset.mems" 2>/dev/null || echo 0\`;
 echo root_cpus=\$root_cpus root_mems=\$root_mems >> \$LOG;
-echo "\$root_mems" > "\$PIN/cpuset.mems"; echo write_mems_rc=\$? >> \$LOG;
-echo "\$root_cpus" > "\$PIN/cpuset.cpus"; echo write_cpus_rc=\$? >> \$LOG;
-if [ -w "\$PIN/cpuset.memory_migrate" ]; then echo 1 > "\$PIN/cpuset.memory_migrate" || true; fi;
-echo 100000 > "\$QDIR/cpu.cfs_period_us"; echo write_period_rc=\$? >> \$LOG;
-echo \$quota > "\$QDIR/cpu.cfs_quota_us"; echo write_quota_rc=\$? >> \$LOG;
-if [ -w "\$QDIR/cpu.max" ]; then echo "\$quota 100000" > "\$QDIR/cpu.max" || true; fi;
+hostcg "echo \$root_mems > \$PIN/cpuset.mems; echo \$root_cpus > \$PIN/cpuset.cpus; if [ -w \$PIN/cpuset.memory_migrate ]; then echo 1 > \$PIN/cpuset.memory_migrate; fi; echo 100000 > \$QDIR/cpu.cfs_period_us; echo \$quota > \$QDIR/cpu.cfs_quota_us; if [ -w \$QDIR/cpu.max ]; then echo \$quota 100000 > \$QDIR/cpu.max; fi";
+echo after_write_cpus=\$(cat \$PIN/cpuset.cpus 2>&1) after_write_quota=\$(cat \$QDIR/cpu.cfs_quota_us 2>&1) >> \$LOG;
 cs_path=\`grep :cpuset: /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
 cpu_path=\`grep -E ":(cpu|cpu,cpuacct):" /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
 echo cs_path=\$cs_path cpu_path=\$cpu_path >> \$LOG;
 cat /proc/self/cgroup >> \$LOG;
-mvto() { s=\$1; d=\$2; if [ ! -f "\$s/cgroup.procs" ]; then echo missing_src=\$s >> \$LOG; return 0; fi; if [ ! -f "\$d/cgroup.procs" ]; then echo missing_dst=\$d >> \$LOG; return 0; fi; for p in \`cat "\$s/cgroup.procs" 2>/dev/null\`; do echo \$p > "\$d/cgroup.procs" 2>/dev/null && echo moved \$p to \$d >> \$LOG || echo move_fail \$p to \$d >> \$LOG; done; };
+mvto() { s=\$1; d=\$2; if [ ! -f "\$s/cgroup.procs" ]; then echo missing_src=\$s >> \$LOG; return 0; fi; if [ ! -f "\$d/cgroup.procs" ]; then echo missing_dst=\$d >> \$LOG; return 0; fi; for p in \`cat "\$s/cgroup.procs" 2>/dev/null\`; do hostcg "echo \$p > \$d/cgroup.procs" && echo moved \$p to \$d >> \$LOG || echo move_fail \$p to \$d >> \$LOG; done; };
 migrate() { if [ -n "\$cs_path" ]; then mvto "\$CS\$cs_path" "\$PIN"; fi; if [ -n "\$cpu_path" ]; then mvto "\$CPU\$cpu_path" "\$QDIR"; fi; if [ -d /var/sankuai/hulk/one-cpu-config ]; then mvto /var/sankuai/hulk/one-cpu-config "\$QDIR"; fi; };
 migrate;
 ls -l \$PIN \$QDIR >> \$LOG 2>&1;
 echo CG_SETUP_DONE >> \$LOG;
 ( while true; do migrate; sleep 2; done ) &
 EOF
+}
+
+# 本机 root 预创建自定义 cgroup（脚本跑在哪台 node 上，就只覆盖那一台）。
+# 其它 node 靠 Pod 内 nsenter；本机再迁一次作为兜底。
+host_ensure_mqs_full_cpuset() {
+  local pin="/sys/fs/cgroup/cpuset/mqs_full_cpuset"
+  local cpu_root="/sys/fs/cgroup/cpu"
+  local root_cpus root_mems
+  if [[ ! -f /sys/fs/cgroup/cpuset/cgroup.procs ]]; then
+    echo "提示: 本机没有 /sys/fs/cgroup/cpuset/cgroup.procs，跳过宿主机预创建"
+    return 0
+  fi
+  if ! mkdir -p "$pin"; then
+    echo "警告: 本机 mkdir $pin 失败"
+    return 0
+  fi
+  root_mems=$(cat /sys/fs/cgroup/cpuset/cpuset.mems 2>/dev/null || echo 0)
+  root_cpus=$(cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null || cat /sys/devices/system/cpu/online)
+  echo "$root_mems" > "$pin/cpuset.mems" || true
+  echo "$root_cpus" > "$pin/cpuset.cpus" || true
+  if [[ -w "$pin/cpuset.memory_migrate" ]]; then
+    echo 1 > "$pin/cpuset.memory_migrate" || true
+  fi
+  echo "  宿主机已预创建 $pin cpus=$(cat "$pin/cpuset.cpus" 2>/dev/null) mems=$(cat "$pin/cpuset.mems" 2>/dev/null)"
+  if [[ -f "$cpu_root/cgroup.procs" ]]; then
+    echo "  宿主机 cpu 控制器: $cpu_root （各 Pod 的 mqs_quota_<hostname> 由启动脚本创建）"
+  fi
+}
+
+host_container_pid() {
+  local raw="$1"
+  local cid="${raw#*://}"
+  cid="${cid%%[$'\r\n']*}"
+  local short="${cid:0:64}"
+  local pid=""
+  if command -v crictl >/dev/null 2>&1 && [[ -n "$short" ]]; then
+    pid=$(crictl inspect "$short" 2>/dev/null | awk -F '[^0-9]+' '/"pid":/ { print $2; exit }')
+  fi
+  if [[ -z "$pid" || "$pid" == "0" ]] && command -v docker >/dev/null 2>&1 && [[ -n "$short" ]]; then
+    pid=$(docker inspect -f '{{.State.Pid}}' "$short" 2>/dev/null || true)
+  fi
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$pid"
+  fi
+}
+
+host_move_pid_cgroup() {
+  local pid="$1"
+  local pin="/sys/fs/cgroup/cpuset/mqs_full_cpuset"
+  local cpu_root="/sys/fs/cgroup/cpu"
+  local qdir cs_path cpu_path p
+  [[ -f "$pin/cgroup.procs" ]] || return 0
+  [[ -d "/proc/$pid" ]] || return 0
+  cs_path=$(awk -F: '/:cpuset:/{print $3; exit}' "/proc/$pid/cgroup" 2>/dev/null)
+  cpu_path=$(awk -F: '/:(cpu|cpu,cpuacct):/{print $3; exit}' "/proc/$pid/cgroup" 2>/dev/null)
+  if [[ -n "$cs_path" && -f "/sys/fs/cgroup/cpuset${cs_path}/cgroup.procs" ]]; then
+    while read -r p; do
+      [[ -n "$p" ]] || continue
+      echo "$p" > "$pin/cgroup.procs" 2>/dev/null || true
+    done < "/sys/fs/cgroup/cpuset${cs_path}/cgroup.procs"
+  else
+    echo "$pid" > "$pin/cgroup.procs" 2>/dev/null || true
+  fi
+  qdir="${cpu_root}/mqs_quota_$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | awk -F= '/^HOSTNAME=/{print $2; exit}')"
+  if [[ ! -d "$qdir" ]]; then
+    qdir="${cpu_root}/mqs_quota_${pid}"
+  fi
+  mkdir -p "$qdir" || true
+  echo 100000 > "$qdir/cpu.cfs_period_us" 2>/dev/null || true
+  echo $(( CPU_CORES * 100000 )) > "$qdir/cpu.cfs_quota_us" 2>/dev/null || true
+  if [[ -n "$cpu_path" && -f "${cpu_root}${cpu_path}/cgroup.procs" ]]; then
+    while read -r p; do
+      [[ -n "$p" ]] || continue
+      echo "$p" > "$qdir/cgroup.procs" 2>/dev/null || true
+    done < "${cpu_root}${cpu_path}/cgroup.procs"
+  fi
+  if [[ -f /sys/fs/cgroup/cpu/all-rocket-config/one-cpu-config/cgroup.procs ]]; then
+    while read -r p; do
+      [[ -n "$p" ]] || continue
+      if [[ -d "/proc/$p" ]] && grep -q "mqs" "/proc/$p/cmdline" 2>/dev/null; then
+        echo "$p" > "$qdir/cgroup.procs" 2>/dev/null || true
+      fi
+    done < /sys/fs/cgroup/cpu/all-rocket-config/one-cpu-config/cgroup.procs
+  fi
+}
+
+host_migrate_local_proxy_pods() {
+  local this_host pin pod cid pid node_name
+  pin="/sys/fs/cgroup/cpuset/mqs_full_cpuset"
+  [[ -f "$pin/cgroup.procs" ]] || return 0
+  this_host=$(hostname -f 2>/dev/null || hostname)
+  while read -r pod node_name; do
+    [[ -n "$pod" ]] || continue
+    if [[ "$node_name" != "$this_host" && "$node_name" != "$(hostname)" && "$node_name" != "$(hostname -s 2>/dev/null)" ]]; then
+      continue
+    fi
+    cid=$(kubectl_cmd get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}{.name}{" "}{.containerID}{"\n"}{end}' 2>/dev/null | awk '$1=="app"{print $2; exit}')
+    pid=$(host_container_pid "$cid")
+    if [[ -z "$pid" ]]; then
+      echo "  本机 ${pod}: 未解析到 app 容器 PID（cid=${cid:-empty}）"
+      continue
+    fi
+    host_move_pid_cgroup "$pid"
+    echo "  本机已迁移 ${pod} pid=${pid} -> $pin procs=$(tr '\n' ',' < "$pin/cgroup.procs" 2>/dev/null)"
+  done < <(kubectl_cmd get pods -l "$LABEL_SELECTOR" --field-selector="status.phase=Running" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' 2>/dev/null)
+}
+
+host_start_mqs_cgroup_keeper() {
+  local pidfile="/tmp/mqs-cgroup-keep.pid"
+  local logfile="/tmp/mqs-cgroup-keep.log"
+  [[ -f /sys/fs/cgroup/cpuset/mqs_full_cpuset/cgroup.procs ]] || return 0
+  if [[ -f "$pidfile" ]]; then
+    local old
+    old=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ "$old" =~ ^[1-9][0-9]*$ ]] && kill -0 "$old" 2>/dev/null; then
+      kill "$old" 2>/dev/null || true
+      sleep 0.2
+    fi
+  fi
+  # keeper 必须能看到本脚本的函数；把迁移逻辑写成独立脚本更稳
+  nohup bash -c '
+    pin=/sys/fs/cgroup/cpuset/mqs_full_cpuset
+    cpu_root=/sys/fs/cgroup/cpu
+    while true; do
+      if [[ -f $pin/cgroup.procs ]]; then
+        for cg in /sys/fs/cgroup/cpuset/kubepods.slice /sys/fs/cgroup/cpuset/kubepods; do
+          [[ -d $cg ]] || continue
+          find "$cg" -name cgroup.procs -type f 2>/dev/null | while read -r f; do
+            while read -r p; do
+              [[ -n $p && -d /proc/$p ]] || continue
+              cmd=$(tr "\0" " " < /proc/$p/cmdline 2>/dev/null || true)
+              case $cmd in
+                *mqs*proxy*|*meituan/apps/mqs*) echo $p > $pin/cgroup.procs 2>/dev/null ;;
+              esac
+            done < "$f"
+          done
+        done
+      fi
+      sleep 2
+    done
+  ' >>"$logfile" 2>&1 &
+  echo $! > "$pidfile"
+  echo "  已在本机后台保持迁移（pid=$(cat "$pidfile") log=$logfile）；其它 node 靠 Pod 内 nsenter"
 }
 
 inject_app_entrypoint_wrap() {
@@ -2245,12 +2432,20 @@ create_pod() {
       echo "      请检查模板 containers/volumeMounts 缩进" >&2
       exit 1
     fi
+    if ! grep -qE '^[[:space:]]*hostPID:[[:space:]]*true' "$yaml_file"; then
+      echo "错误: ${yaml_file} 未注入 hostPID: true（容器 cgroup ns 无法在 kubepods 旁 mkdir）。" >&2
+      exit 1
+    fi
+    if ! grep -qE "name:[[:space:]]*host-nsenter" "$yaml_file"; then
+      echo "错误: ${yaml_file} 未注入 host-nsenter（/usr/bin/nsenter）。" >&2
+      exit 1
+    fi
     if ! grep -q "mqs_full_cpuset" "$yaml_file"; then
       echo "错误: ${yaml_file} 的 app command/args 未包含 mqs_full_cpuset 启动脚本。" >&2
       echo "      模板第一个 container 可能不是以 list item 开头，entrypoint 包装失败" >&2
       exit 1
     fi
-    echo "  已注入 host-cgroup-cpuset/cpu + 启动建 /sys/fs/cgroup/cpuset/mqs_full_cpuset"
+    echo "  已注入 hostPID + nsenter + host-cgroup-cpuset/cpu + mqs_full_cpuset"
   fi
 
   local info="  [#${global_idx}] apply ${pod_name} -> ${node}"
@@ -2382,7 +2577,8 @@ else
   if [[ -n "$CPU_CORES" ]]; then
     echo "           app requests.cpu=limits.cpu=${CPU_CORES}（整数）→ QoS Guaranteed；"
     echo "           自定义 cgroup /sys/fs/cgroup/cpuset/mqs_full_cpuset = 整机 CPU，"
-    echo "           /sys/fs/cgroup/cpu/mqs_quota_<pod> CFS quota=${CPU_CORES} 核；内存 ${EFFECTIVE_MEM_NONUMA}"
+    echo "           /sys/fs/cgroup/cpu/mqs_quota_<pod> CFS quota=${CPU_CORES} 核；"
+    echo "           用 hostPID+nsenter 在宿主机 cgroup ns 里 mkdir（容器 ns 会 EPERM）；内存 ${EFFECTIVE_MEM_NONUMA}"
   else
     echo "           CPU quota 保持模板原值（未指定 cpu_com），内存严格限制 ${EFFECTIVE_MEM_NONUMA}"
   fi
@@ -2588,6 +2784,11 @@ fi
 # ---------------------------------------------------------------------------
 declare -a NEW_PODS=()
 
+if [[ -z "$NUMA_SPEC" && -n "$CPU_CORES" ]]; then
+  echo "===== 本机预创建自定义 cgroup ====="
+  host_ensure_mqs_full_cpuset
+fi
+
 if (( END_K >= START_K )); then
   echo "===== 开始创建 Pod #${START_K} ~ #${END_K} ====="
   for ((k = START_K; k <= END_K; k++)); do
@@ -2622,6 +2823,11 @@ if (( END_K >= START_K )); then
 
   echo ""
   wait_new_pods_ready 300
+  if [[ -z "$NUMA_SPEC" && -n "$CPU_CORES" ]]; then
+    echo "===== 本机把 Ready 的 proxy 迁入 mqs_full_cpuset ====="
+    host_migrate_local_proxy_pods
+    host_start_mqs_cgroup_keeper
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -2679,6 +2885,7 @@ else
   echo "        cat /host-cgroup/cpu/mqs_quota_\$HOSTNAME/cpu.cfs_quota_us  # 应=cpu_com*100000"
   echo "        taskset -cp <java-pid>   # 应接近整机，而不是连续 ${CPU_CORES:-N} 核"
   echo "        cat /proc/<pid>/cgroup | grep cpuset   # 应含 mqs_full_cpuset，不是 kubepods 独占核"
+  echo "        kubectl exec -c app -- cat /opt/logs/mqs/cgroup-setup.log   # 应有 NSENTER= 且 after_mkdir 含 mqs_full_cpuset"
   echo ""
   echo "  ----- 自定义 cgroup 验证 -----"
   echo "  # QoS 仍为 Guaranteed（k8s 侧 limit=request）；绑核靠自定义 cpuset 解开"
