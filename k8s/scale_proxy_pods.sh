@@ -1458,14 +1458,15 @@ normalize_java_path() {
 # $ / 引号 / 换行，彻底避开"bash 拼 wrap -> 容器 sh -c 解析 wrap -> wrapper 文件内容
 # 本身还要保留字面 $@"这三层转义地狱（早期版本就是在这里出过 bug）。容器内只需
 # `printf %s "<base64>" | base64 -d > 文件` 还原，然后 chmod +x 即可。
-# 无 NUMA：把宿主机 /sys/fs/cgroup 挂到 app 的 /host-cgroup。
-# 必须挂宿主机 cgroup 树根（与 kubepods 同级），不能在容器自己的 cpuset 下 mkdir：
-# 容器 cpuset 已被 kubelet 独占成 N 核，子 cgroup 无法扩成 0-255。
-ensure_app_host_cgroup_mounts() {
+# 无 NUMA：把宿主机 *控制器* 挂进 app。
+# 不能 hostPath 整个 /sys/fs/cgroup：cgroup v1 的 cpuset/cpu 是 tmpfs 上的子挂载，
+# k8s hostPath 非递归 bind，容器里只能看到空目录，mkdir 不会出现在宿主机控制器下。
+# 必须分别挂 /sys/fs/cgroup/cpuset 和 /sys/fs/cgroup/cpu。
+ensure_one_hostpath_on_app() {
   local yaml_file="$1"
-  local vol_name="host-cgroup"
-  local mount_path="/host-cgroup"
-  local host_path="/sys/fs/cgroup"
+  local vol_name="$2"
+  local host_path="$3"
+  local mount_path="$4"
   local tmp_file="${yaml_file}.hostcg.tmp"
   local has_vol=0
 
@@ -1555,7 +1556,7 @@ ensure_app_host_cgroup_mounts() {
         print "  - name: " vol
         print "    hostPath:"
         print "      path: " hpath
-        print "      type: \"\""
+        print "      type: Directory"
         in_vol=0
         print
         next
@@ -1566,7 +1567,7 @@ ensure_app_host_cgroup_mounts() {
           print "  - name: " vol
           print "    hostPath:"
           print "      path: " hpath
-          print "      type: \"\""
+          print "      type: Directory"
         }
       }
     ' "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
@@ -1576,9 +1577,15 @@ ensure_app_host_cgroup_mounts() {
   - name: ${vol_name}
     hostPath:
       path: ${host_path}
-      type: ""
+      type: Directory
 EOF
   fi
+}
+
+ensure_app_host_cgroup_mounts() {
+  local yaml_file="$1"
+  ensure_one_hostpath_on_app "$yaml_file" "host-cgroup-cpuset" "/sys/fs/cgroup/cpuset" "/host-cgroup/cpuset"
+  ensure_one_hostpath_on_app "$yaml_file" "host-cgroup-cpu" "/sys/fs/cgroup/cpu" "/host-cgroup/cpu"
 }
 
 # wrap 不得含单引号（YAML args 用单引号包一层）。
@@ -1595,10 +1602,10 @@ mkdir -p /opt/logs/mqs; echo CG_SETUP_BEGIN \$(date) > \$LOG;
 HC=/host-cgroup;
 echo ls_host_cgroup=\$(ls -ld \$HC 2>&1) >> \$LOG;
 CS=\$HC/cpuset;
-if [ ! -d "\$CS" ]; then echo FALLBACK_no_host_cgroup >> \$LOG; CS=/sys/fs/cgroup/cpuset; fi;
+if [ ! -f "\$CS/cgroup.procs" ]; then echo FALLBACK_cpuset_not_cgroup >> \$LOG; CS=/sys/fs/cgroup/cpuset; fi;
 CPU=\$HC/cpu;
-if [ ! -d "\$CPU" ]; then CPU="\$HC/cpu,cpuacct"; fi;
-if [ ! -d "\$CPU" ]; then CPU=/sys/fs/cgroup/cpu; fi;
+if [ ! -f "\$CPU/cgroup.procs" ]; then CPU="\$HC/cpuacct"; fi;
+if [ ! -f "\$CPU/cgroup.procs" ]; then CPU=/sys/fs/cgroup/cpu; fi;
 PIN=\$CS/mqs_full_cpuset;
 QDIR=\$CPU/mqs_quota_\$HOSTNAME;
 echo CS=\$CS CPU=\$CPU PIN=\$PIN QDIR=\$QDIR >> \$LOG;
@@ -2233,8 +2240,8 @@ create_pod() {
   fi
 
   if [[ -z "$NUMA_SPEC" && -n "$CPU_CORES" ]]; then
-    if ! grep -qE "name:[[:space:]]*host-cgroup" "$yaml_file"; then
-      echo "错误: ${yaml_file} 未注入 host-cgroup（/sys/fs/cgroup）。自定义 cgroup 不会建在 kubelet 树外。" >&2
+    if ! grep -qE "name:[[:space:]]*host-cgroup-cpuset" "$yaml_file"; then
+      echo "错误: ${yaml_file} 未注入 host-cgroup-cpuset（/sys/fs/cgroup/cpuset）。" >&2
       echo "      请检查模板 containers/volumeMounts 缩进" >&2
       exit 1
     fi
@@ -2243,7 +2250,7 @@ create_pod() {
       echo "      模板第一个 container 可能不是以 list item 开头，entrypoint 包装失败" >&2
       exit 1
     fi
-    echo "  已注入 host-cgroup + 启动建 /sys/fs/cgroup/cpuset/mqs_full_cpuset"
+    echo "  已注入 host-cgroup-cpuset/cpu + 启动建 /sys/fs/cgroup/cpuset/mqs_full_cpuset"
   fi
 
   local info="  [#${global_idx}] apply ${pod_name} -> ${node}"
