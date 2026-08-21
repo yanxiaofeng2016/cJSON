@@ -1585,33 +1585,43 @@ EOF
 # 无 NUMA：在宿主机 cgroup 树上建 kubelet 不会碰的自定义 cpuset/cpu cgroup，
 # 把 kubepods 里的进程迁过去。cgroup v1 各控制器独立，memory/pids 仍由 k8s 管。
 # 本函数以 & 结尾；调用方必须用空格拼接后续命令，禁止 "; mkdir"（&; 会 CrashLoop）。
+# 过程写到 /opt/logs/mqs/cgroup-setup.log，mkdir 失败不再静默。
 cpu_quota_shell_cmd() {
   local q=$(( $1 * 100000 ))
   tr -s '[:space:]' ' ' <<EOF
 quota=${q};
+LOG=/opt/logs/mqs/cgroup-setup.log;
+mkdir -p /opt/logs/mqs; echo CG_SETUP_BEGIN \$(date) > \$LOG;
 HC=/host-cgroup;
+echo ls_host_cgroup=\$(ls -ld \$HC 2>&1) >> \$LOG;
 CS=\$HC/cpuset;
-if [ ! -d "\$CS" ]; then CS=/sys/fs/cgroup/cpuset; fi;
+if [ ! -d "\$CS" ]; then echo FALLBACK_no_host_cgroup >> \$LOG; CS=/sys/fs/cgroup/cpuset; fi;
 CPU=\$HC/cpu;
 if [ ! -d "\$CPU" ]; then CPU="\$HC/cpu,cpuacct"; fi;
 if [ ! -d "\$CPU" ]; then CPU=/sys/fs/cgroup/cpu; fi;
 PIN=\$CS/mqs_full_cpuset;
 QDIR=\$CPU/mqs_quota_\$HOSTNAME;
-mkdir -p "\$PIN" || true;
-mkdir -p "\$QDIR" || true;
+echo CS=\$CS CPU=\$CPU PIN=\$PIN QDIR=\$QDIR >> \$LOG;
+mkdir -p "\$PIN"; echo mkdir_pin_rc=\$? >> \$LOG;
+mkdir -p "\$QDIR"; echo mkdir_quota_rc=\$? >> \$LOG;
 root_cpus=\`cat "\$CS/cpuset.cpus" 2>/dev/null || cat /sys/devices/system/cpu/online\`;
 root_mems=\`cat "\$CS/cpuset.mems" 2>/dev/null || echo 0\`;
-echo "\$root_mems" > "\$PIN/cpuset.mems" || true;
-echo "\$root_cpus" > "\$PIN/cpuset.cpus" || true;
+echo root_cpus=\$root_cpus root_mems=\$root_mems >> \$LOG;
+echo "\$root_mems" > "\$PIN/cpuset.mems"; echo write_mems_rc=\$? >> \$LOG;
+echo "\$root_cpus" > "\$PIN/cpuset.cpus"; echo write_cpus_rc=\$? >> \$LOG;
 if [ -w "\$PIN/cpuset.memory_migrate" ]; then echo 1 > "\$PIN/cpuset.memory_migrate" || true; fi;
-echo 100000 > "\$QDIR/cpu.cfs_period_us" || true;
-echo \$quota > "\$QDIR/cpu.cfs_quota_us" || true;
+echo 100000 > "\$QDIR/cpu.cfs_period_us"; echo write_period_rc=\$? >> \$LOG;
+echo \$quota > "\$QDIR/cpu.cfs_quota_us"; echo write_quota_rc=\$? >> \$LOG;
 if [ -w "\$QDIR/cpu.max" ]; then echo "\$quota 100000" > "\$QDIR/cpu.max" || true; fi;
 cs_path=\`grep :cpuset: /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
 cpu_path=\`grep -E ":(cpu|cpu,cpuacct):" /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
-mvto() { s=\$1; d=\$2; if [ ! -f "\$s/cgroup.procs" ]; then return 0; fi; if [ ! -f "\$d/cgroup.procs" ]; then return 0; fi; for p in \`cat "\$s/cgroup.procs" 2>/dev/null\`; do echo \$p > "\$d/cgroup.procs" 2>/dev/null || true; done; };
+echo cs_path=\$cs_path cpu_path=\$cpu_path >> \$LOG;
+cat /proc/self/cgroup >> \$LOG;
+mvto() { s=\$1; d=\$2; if [ ! -f "\$s/cgroup.procs" ]; then echo missing_src=\$s >> \$LOG; return 0; fi; if [ ! -f "\$d/cgroup.procs" ]; then echo missing_dst=\$d >> \$LOG; return 0; fi; for p in \`cat "\$s/cgroup.procs" 2>/dev/null\`; do echo \$p > "\$d/cgroup.procs" 2>/dev/null && echo moved \$p to \$d >> \$LOG || echo move_fail \$p to \$d >> \$LOG; done; };
 migrate() { if [ -n "\$cs_path" ]; then mvto "\$CS\$cs_path" "\$PIN"; fi; if [ -n "\$cpu_path" ]; then mvto "\$CPU\$cpu_path" "\$QDIR"; fi; if [ -d /var/sankuai/hulk/one-cpu-config ]; then mvto /var/sankuai/hulk/one-cpu-config "\$QDIR"; fi; };
 migrate;
+ls -l \$PIN \$QDIR >> \$LOG 2>&1;
+echo CG_SETUP_DONE >> \$LOG;
 ( while true; do migrate; sleep 2; done ) &
 EOF
 }
@@ -1691,6 +1701,8 @@ WRAPEOF
     BEGIN {
       done = 0
       skip = 0
+      in_c = 0
+      list_indent = -1
       wrap = ENVIRON["WRAP_SCRIPT"]
     }
     function emit_wrapped_as_list_item() {
@@ -1700,21 +1712,19 @@ WRAPEOF
       print "    args:"
       print "    - '\''" wrap "'\''"
     }
-    /^  containers:[[:space:]]*$/ { print; next }
+    /^  containers:[[:space:]]*$/ { in_c = 1; print; next }
     # 已处理完 app：后续 container（sidecar）一律原样输出
     done { print; next }
 
-    # 模板: "  - args:" 或 "  - args: [proxy]"
-    !skip && /^  - args:[[:space:]]*(\[.*\])?[[:space:]]*$/ {
-      emit_wrapped_as_list_item()
-      skip = 1
-      next
-    }
-    # 少数模板: "  - command:" 或 flow-style command 在前
-    !skip && /^  - command:[[:space:]]*(\[.*\])?[[:space:]]*$/ {
-      emit_wrapped_as_list_item()
-      skip = 1
-      next
+    # 第一个 container 的 list item（无论 - args: / - command: / - name:）都包装
+    in_c && !skip && match($0, /^( *)- /) {
+      sp = RLENGTH - 2
+      if (list_indent < 0) list_indent = sp
+      if (sp == list_indent) {
+        emit_wrapped_as_list_item()
+        skip = 1
+        next
+      }
     }
     skip {
       if (/^    env:[[:space:]]*$/ || /^    image:/ || /^    name:[[:space:]]+app/ || /^    imagePullPolicy:/) {
@@ -2220,6 +2230,20 @@ create_pod() {
   elif [[ -n "$CPU_CORES" ]]; then
     # 无 java_path / --update-jvm 时也要包装 entrypoint，才能在启动时写入 cfs quota
     inject_app_entrypoint_wrap "$yaml_file" "" "" 0
+  fi
+
+  if [[ -z "$NUMA_SPEC" && -n "$CPU_CORES" ]]; then
+    if ! grep -qE "name:[[:space:]]*host-cgroup" "$yaml_file"; then
+      echo "错误: ${yaml_file} 未注入 host-cgroup（/sys/fs/cgroup）。自定义 cgroup 不会建在 kubelet 树外。" >&2
+      echo "      请检查模板 containers/volumeMounts 缩进" >&2
+      exit 1
+    fi
+    if ! grep -q "mqs_full_cpuset" "$yaml_file"; then
+      echo "错误: ${yaml_file} 的 app command/args 未包含 mqs_full_cpuset 启动脚本。" >&2
+      echo "      模板第一个 container 可能不是以 list item 开头，entrypoint 包装失败" >&2
+      exit 1
+    fi
+    echo "  已注入 host-cgroup + 启动建 /sys/fs/cgroup/cpuset/mqs_full_cpuset"
   fi
 
   local info="  [#${global_idx}] apply ${pod_name} -> ${node}"
