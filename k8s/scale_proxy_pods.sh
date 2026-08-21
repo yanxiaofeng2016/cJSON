@@ -140,6 +140,12 @@ NUMA_CPUSET_ANNOTATION_KEY="${NUMA_CPUSET_ANNOTATION_KEY:-hulk.alpha.kubernetes.
 NONUMA_MEM_LIMIT="${NONUMA_MEM_LIMIT:-32Gi}"
 # app_version=1.8 时覆盖 app（第一个 container）镜像；1.6/省略保持模板
 APP_IMAGE_V18="docker.io/system_test/com.sankuai.mqs:stable_amd64_1785306832245"
+# 无 NUMA 自定义 cgroup：是否用 hostPID + nsenter 进宿主机 cgroup namespace。
+# 默认关闭：hostPID 会让容器看到宿主机 PID 1（systemd），Hulk 的 agent/启动检查
+# 会因此判定环境异常并立刻退出（表现为起容器后秒退 CrashLoopBackOff）。
+# 直接在 hostPath 挂进来的控制器目录上 mkdir 通常就够了；只有当日志里出现
+# mkdir_pin_rc!=0 / direct_fail 时才需要 MQS_CGROUP_HOSTPID=1 打开。
+CGROUP_HOSTPID="${MQS_CGROUP_HOSTPID:-0}"
 
 # 规范化 --mem / mem= 的内存取值为合法 k8s Quantity。
 # 用户口语 "16C16G" 中的 16G 指的是 16Gi（二进制吉字节），而非 SI 十进制 G，
@@ -1607,9 +1613,12 @@ ensure_pod_host_pid() {
 ensure_app_host_cgroup_mounts() {
   local yaml_file="$1"
   local nsenter_host="/usr/bin/nsenter"
-  ensure_pod_host_pid "$yaml_file"
   ensure_one_hostpath_on_app "$yaml_file" "host-cgroup-cpuset" "/sys/fs/cgroup/cpuset" "/host-cgroup/cpuset"
   ensure_one_hostpath_on_app "$yaml_file" "host-cgroup-cpu" "/sys/fs/cgroup/cpu" "/host-cgroup/cpu"
+  if [[ "$CGROUP_HOSTPID" != "1" ]]; then
+    return 0
+  fi
+  ensure_pod_host_pid "$yaml_file"
   # 镜像里通常没有 nsenter；从宿主机挂进来（hostPID 下 -t 1 才是 systemd）
   if [[ ! -x "$nsenter_host" && -x /bin/nsenter ]]; then
     nsenter_host="/bin/nsenter"
@@ -1662,7 +1671,8 @@ hostcg "echo 100000 > \$QDIR/cpu.cfs_period_us"; echo write_period_rc=\$? >> \$L
 hostcg "echo \$quota > \$QDIR/cpu.cfs_quota_us"; echo write_quota_rc=\$? >> \$LOG;
 echo after_write_cpus=\$(cat \$PIN/cpuset.cpus 2>&1) after_write_quota=\$(cat \$QDIR/cpu.cfs_quota_us 2>&1) >> \$LOG;
 myproc=/proc/self/cgroup;
-if [ -n "\$NSENTER" ]; then hostcs=\`\$NSENTER -t 1 -C -- cat /proc/\$\$/cgroup 2>/dev/null\`; if [ -n "\$hostcs" ]; then echo "\$hostcs" > /tmp/mqs-hostcgroup; myproc=/tmp/mqs-hostcgroup; fi; fi;
+cs_path=\`grep :cpuset: \$myproc 2>/dev/null | head -1 | cut -d: -f3\`;
+if [ -z "\$cs_path" ] || [ "\$cs_path" = / ]; then if [ -n "\$NSENTER" ]; then \$NSENTER -t 1 -C -- cat /proc/\$\$/cgroup > /tmp/mqs-hostcgroup 2>/dev/null; if grep -q :cpuset: /tmp/mqs-hostcgroup 2>/dev/null; then myproc=/tmp/mqs-hostcgroup; fi; fi; fi;
 cs_path=\`grep :cpuset: \$myproc 2>/dev/null | head -1 | cut -d: -f3\`;
 cpu_path=\`grep -E ":(cpu|cpu,cpuacct):" \$myproc 2>/dev/null | head -1 | cut -d: -f3\`;
 echo myproc=\$myproc cs_path=\$cs_path cpu_path=\$cpu_path >> \$LOG;
@@ -2448,12 +2458,18 @@ create_pod() {
       echo "      请检查模板 containers/volumeMounts 缩进" >&2
       exit 1
     fi
-    if ! grep -qE '^[[:space:]]*hostPID:[[:space:]]*true' "$yaml_file"; then
-      echo "错误: ${yaml_file} 未注入 hostPID: true（容器 cgroup ns 无法在 kubepods 旁 mkdir）。" >&2
-      exit 1
-    fi
-    if ! grep -qE "name:[[:space:]]*host-nsenter" "$yaml_file"; then
-      echo "错误: ${yaml_file} 未注入 host-nsenter（/usr/bin/nsenter）。" >&2
+    if [[ "$CGROUP_HOSTPID" == "1" ]]; then
+      if ! grep -qE '^[[:space:]]*hostPID:[[:space:]]*true' "$yaml_file"; then
+        echo "错误: MQS_CGROUP_HOSTPID=1 但 ${yaml_file} 未注入 hostPID: true。" >&2
+        exit 1
+      fi
+      if ! grep -qE "name:[[:space:]]*host-nsenter" "$yaml_file"; then
+        echo "错误: MQS_CGROUP_HOSTPID=1 但 ${yaml_file} 未注入 host-nsenter。" >&2
+        exit 1
+      fi
+    elif grep -qE '^[[:space:]]*hostPID:[[:space:]]*true' "$yaml_file"; then
+      echo "错误: ${yaml_file} 含 hostPID: true 但未开启 MQS_CGROUP_HOSTPID=1。" >&2
+      echo "      hostPID 会让 Hulk agent 看到宿主机 PID 1 后秒退（CrashLoopBackOff）" >&2
       exit 1
     fi
     if ! grep -q "mqs_full_cpuset" "$yaml_file"; then
@@ -2461,7 +2477,11 @@ create_pod() {
       echo "      模板第一个 container 可能不是以 list item 开头，entrypoint 包装失败" >&2
       exit 1
     fi
-    echo "  已注入 hostPID + nsenter + host-cgroup-cpuset/cpu + mqs_full_cpuset"
+    if [[ "$CGROUP_HOSTPID" == "1" ]]; then
+      echo "  已注入 hostPID + nsenter + host-cgroup-cpuset/cpu + mqs_full_cpuset"
+    else
+      echo "  已注入 host-cgroup-cpuset/cpu + mqs_full_cpuset（无 hostPID；如需 nsenter 用 MQS_CGROUP_HOSTPID=1）"
+    fi
   fi
 
   local info="  [#${global_idx}] apply ${pod_name} -> ${node}"
