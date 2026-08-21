@@ -14,23 +14,23 @@
 #   cpu_com=8      同上，设为 8 核（不指定则保持模板原值）
 #                  不动 hulk-sidecar / hulk-init 的 CPU（模板默认通常为 1 或 100m）。
 #                  总 Pod CPU request ≈ app + sidecar（如 16+1=17），Guaranteed 准入按总和计。
-#   无 NUMA 时（整机共享 + quota 限制模式）：
-#              不绑定 cpuset/内存节点：清除模板中可能残留的 HULK_CPUSET/HULK_NUMA_NODE
-#              env 及对应 annotation，容器可用整机所有 CPU（如 128 核）和所有 NUMA 内存。
-#              app 容器 CPU 用量严格限制为 cpu_com 核（如 16 → 上限 1600%），
-#              与是否 --update-jvm 无关，只要写了 cpu_com=N 就生效：
-#              1) resources.limits.cpu=N
-#              2) 模板 HULK_CORE / HULK_CORE_NUM 改为 N（hulk-init 按此写 CPU cgroup；
-#                 只改 k8s limits 而 HULK_CORE 仍为 32 时，实际会超过 N 核）
-#              3) JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=N（无 event_loop 时），
-#                 避免 JVM 按整机 128 核去开 GC 线程把用量顶到 2000%。
-#              省略 cpu_com 则保持模板原值。
-#              app 容器 limits.cpu=N，requests.cpu=N*1000-100m（如 16 → 15900m）。
-#              QoS=Burstable：kubelet static CPU manager 不独占绑核，容器可在整机
-#              cpuset 上调度；用量由 limits + HULK_CORE + 启动写 quota 硬限制为 N 核。
-#              以前 15900m 会超 N 核，是因为 HULK_CORE 仍为 32 / sidecar 改回 quota，
-#              不是「Burstable 就可突破 limits」。
-#              内存不做节点绑定，但由 memory cgroup 严格限制 resources.limits.memory=32Gi。
+#   无 NUMA 时（自定义 cgroup：整机 cpuset + N 核 quota）：
+#              不注入 HULK_CPUSET/HULK_NUMA_NODE。app requests.cpu=limits.cpu=N（整数）。
+#              不要再用 15900m Burstable：kubelet 的 CFS quota 会被 Hulk 绕开，实际会超 N 核。
+#              做法（cgroup v1，各控制器独立，内存/pids 仍留在 kubelet 的 cgroup）：
+#              1) hostPath 挂载宿主机 /sys/fs/cgroup -> /host-cgroup
+#              2) 在 kubelet 不会管的树上建自定义 cgroup（与 kubepods 同级，不是容器 cgroup 的子目录，
+#                 否则 parent 已被独占绑核，子 cgroup 无法扩成 0-255）：
+#                   mkdir /host-cgroup/cpuset/mqs_full_cpuset
+#                   echo "<online>" > cpuset.cpus
+#                   echo "<node online>" > cpuset.mems
+#                   mkdir /host-cgroup/cpu/mqs_quota_<pod>
+#                   echo N*100000 > cpu.cfs_quota_us
+#              3) 把 kubelet 容器 cgroup 里的 host PID 迁到上述自定义 cgroup
+#                 （echo $pid > cgroup.procs）；后台循环防止 kubelet/Hulk 把进程迁回去
+#              4) 同步 HULK_CORE/HULK_CORE_NUM=N
+#              5) JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=N（无 event_loop 时）
+#              内存不做节点绑定，由 memory cgroup 限制 resources.limits.memory=32Gi。
 #   有 NUMA 时：省略 cpu_com → 自动设为整 NUMA 核数（从本机 OS 实时读取，
 #              SMT on 时常为 32，SMT off 时常为 16；勿写死）
 #              cpu_com=N（1<=N<=NUMA核数）→ 取该 NUMA OS cpuset 的前 N 个 CPU 作为子集
@@ -274,12 +274,13 @@ usage() {
 可选参数（任意位置）:
   cpu_com=<N>          仅设置 app（第一个 container）的 CPU 核数；sidecar/init 保持模板原值
                        总 Pod CPU request ≈ app + sidecar（如 16+1=17），Guaranteed 按总和计
-                       无 NUMA（整机共享+quota 限制模式）：
-                         不绑定 cpuset/内存节点，容器跑在整机共享 cpuset；
-                         app limits.cpu=N，requests.cpu=N*1000-100m（如 16 → 15900m），
-                         QoS=Burstable（不独占绑核）；用量硬限制为 N 核（上限 N00%）；
-                         同步 HULK_CORE/HULK_CORE_NUM=N，启动脚本写 CFS quota；
-                         内存严格限制 32Gi（memory cgroup）；省略 cpu_com 则保持模板原值
+                       无 NUMA（自定义 cgroup：整机 cpuset + N 核 quota）：
+                         不绑 HULK_CPUSET；app requests=limits=N（整数，Guaranteed）；
+                         启动时在 /sys/fs/cgroup/cpuset/mqs_full_cpuset 建 kubelet 不管的
+                         cpuset（online 全核），把进程从 kubepods 迁过去；
+                         另建 cpu/mqs_quota_<pod>，CFS quota=N，用量上限 N00%；
+                         不要用 15900m Burstable（Hulk 会绕开 k8s limit 超 N 核）；
+                         内存严格限制 32Gi；省略 cpu_com 则保持模板原值
                        有 NUMA：省略则自动设为整 NUMA 核数（本机 OS 实时拓扑；
                          SMT on 常 32，SMT off 常 16）
                        cpu_com=N（1<=N<=NUMA核数）→ 取该 NUMA cpuset 前 N 个 CPU；
@@ -1457,16 +1458,162 @@ normalize_java_path() {
 # $ / 引号 / 换行，彻底避开"bash 拼 wrap -> 容器 sh -c 解析 wrap -> wrapper 文件内容
 # 本身还要保留字面 $@"这三层转义地狱（早期版本就是在这里出过 bug）。容器内只需
 # `printf %s "<base64>" | base64 -d > 文件` 还原，然后 chmod +x 即可。
-# wrap 不得含单引号（YAML args 用单引号包一层）——base64 字母表本身没有单引号，天然满足。
-# 容器内直接写 cfs quota（无单引号，可塞进 YAML 单引号 wrap）。
-# hulk 会把进程放到自己的 CPU cgroup，k8s limits.cpu 经常管不住（docker stats 能到 2000%+）。
-# 启动时写一次，并后台再写 15s，防止 sidecar 随后把 quota 改回 32 核。
+# 无 NUMA：把宿主机 /sys/fs/cgroup 挂到 app 的 /host-cgroup。
+# 必须挂宿主机 cgroup 树根（与 kubepods 同级），不能在容器自己的 cpuset 下 mkdir：
+# 容器 cpuset 已被 kubelet 独占成 N 核，子 cgroup 无法扩成 0-255。
+ensure_app_host_cgroup_mounts() {
+  local yaml_file="$1"
+  local vol_name="host-cgroup"
+  local mount_path="/host-cgroup"
+  local host_path="/sys/fs/cgroup"
+  local tmp_file="${yaml_file}.hostcg.tmp"
+  local has_vol=0
+
+  awk -v vol="$vol_name" -v mpath="$mount_path" '
+    BEGIN {
+      in_containers = 0
+      cidx = 0
+      in_first = 0
+      in_vm = 0
+      vm_injected = 0
+      nbuf = 0
+    }
+    function flush_vm_entry(   i, is_target) {
+      if (nbuf == 0) return
+      is_target = 0
+      for (i = 1; i <= nbuf; i++) {
+        if (buf[i] ~ ("name:[[:space:]]*" vol "([[:space:]]|$)")) is_target = 1
+      }
+      if (!is_target) {
+        for (i = 1; i <= nbuf; i++) print buf[i]
+      }
+      nbuf = 0
+    }
+    function inject_mount() {
+      if (vm_injected) return
+      print "    - mountPath: " mpath
+      print "      name: " vol
+      vm_injected = 1
+    }
+    /^  containers:[[:space:]]*$/ { in_containers = 1; print; next }
+    in_containers && /^  - / {
+      flush_vm_entry()
+      if (in_vm && in_first && !vm_injected) inject_mount()
+      in_vm = 0
+      cidx++
+      in_first = (cidx == 1)
+      print
+      next
+    }
+    in_containers && /^  [a-zA-Z]/ && !/^  - / {
+      flush_vm_entry()
+      if (in_vm && in_first && !vm_injected) inject_mount()
+      in_containers = 0
+      in_first = 0
+      in_vm = 0
+      print
+      next
+    }
+    in_first && /^    volumeMounts:[[:space:]]*$/ { in_vm = 1; print; next }
+    in_first && in_vm && /^    [a-zA-Z]/ && !/^    - / {
+      flush_vm_entry()
+      if (!vm_injected) inject_mount()
+      in_vm = 0
+      print
+      next
+    }
+    in_first && in_vm && /^    - mountPath:/ {
+      flush_vm_entry()
+      buf[++nbuf] = $0
+      next
+    }
+    in_first && in_vm && nbuf > 0 { buf[++nbuf] = $0; next }
+    { if (!in_first || !in_vm) print }
+    END {
+      flush_vm_entry()
+      if (in_vm && in_first && !vm_injected) inject_mount()
+    }
+  ' "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
+
+  if awk -v vol="$vol_name" '
+        /^  volumes:[[:space:]]*$/ { in_vol=1; next }
+        in_vol && /^  [a-zA-Z]/ && !/^  - / { in_vol=0 }
+        in_vol && $0 ~ ("name:[[:space:]]*" vol "([[:space:]]|$)") { found=1; exit }
+        END { exit !found }
+      ' "$yaml_file"; then
+    has_vol=1
+  fi
+
+  if (( has_vol )); then
+    return 0
+  fi
+
+  if grep -q "^  volumes:[[:space:]]*$" "$yaml_file" 2>/dev/null; then
+    awk -v vol="$vol_name" -v hpath="$host_path" '
+      /^  volumes:[[:space:]]*$/ { in_vol=1; print; next }
+      in_vol && /^  [a-zA-Z]/ && !/^  - / {
+        print "  - name: " vol
+        print "    hostPath:"
+        print "      path: " hpath
+        print "      type: \"\""
+        in_vol=0
+        print
+        next
+      }
+      { print }
+      END {
+        if (in_vol) {
+          print "  - name: " vol
+          print "    hostPath:"
+          print "      path: " hpath
+          print "      type: \"\""
+        }
+      }
+    ' "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
+  else
+    cat >> "$yaml_file" <<EOF
+  volumes:
+  - name: ${vol_name}
+    hostPath:
+      path: ${host_path}
+      type: ""
+EOF
+  fi
+}
+
+# wrap 不得含单引号（YAML args 用单引号包一层）。
+# 无 NUMA：在宿主机 cgroup 树上建 kubelet 不会碰的自定义 cpuset/cpu cgroup，
+# 把 kubepods 里的进程迁过去。cgroup v1 各控制器独立，memory/pids 仍由 k8s 管。
+# 本函数以 & 结尾；调用方必须用空格拼接后续命令，禁止 "; mkdir"（&; 会 CrashLoop）。
 cpu_quota_shell_cmd() {
   local q=$(( $1 * 100000 ))
-  # 写 CFS quota（k8s + Hulk one-cpu-config），并把 cpuset 扩到 online 全核。
-  # 后台再刷 15s，防止 sidecar 随后把 quota 改回 32 核或重新绑核。
-  # 本函数以 & 结尾；调用方必须用空格拼接后续命令，禁止 "; mkdir"（&; 会 CrashLoop）。
-  printf 'quota=%s; wq() { for f in /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us /var/sankuai/hulk/one-cpu-config/cpu.cfs_quota_us; do if [ -w "$f" ]; then echo $quota > "$f" || true; fi; done; if [ -w /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then echo 100000 > /sys/fs/cgroup/cpu/cpu.cfs_period_us || true; fi; if [ -w /sys/fs/cgroup/cpu.max ]; then echo "$quota 100000" > /sys/fs/cgroup/cpu.max || true; fi; }; wcset() { online=`cat /sys/devices/system/cpu/online 2>/dev/null || true`; [ -n "$online" ] || return 0; for f in /sys/fs/cgroup/cpuset/cpuset.cpus /sys/fs/cgroup/cpuset.cpus; do if [ -w "$f" ]; then echo "$online" > "$f" || true; fi; done; mems=`cat /sys/devices/system/node/online 2>/dev/null || true`; [ -n "$mems" ] || return 0; for f in /sys/fs/cgroup/cpuset/cpuset.mems /sys/fs/cgroup/cpuset.mems; do if [ -w "$f" ]; then echo "$mems" > "$f" || true; fi; done; }; wq; wcset; (i=0; while [ $i -lt 15 ]; do sleep 1; wq; wcset; i=$((i+1)); done) &' "$q"
+  tr -s '[:space:]' ' ' <<EOF
+quota=${q};
+HC=/host-cgroup;
+CS=\$HC/cpuset;
+if [ ! -d "\$CS" ]; then CS=/sys/fs/cgroup/cpuset; fi;
+CPU=\$HC/cpu;
+if [ ! -d "\$CPU" ]; then CPU="\$HC/cpu,cpuacct"; fi;
+if [ ! -d "\$CPU" ]; then CPU=/sys/fs/cgroup/cpu; fi;
+PIN=\$CS/mqs_full_cpuset;
+QDIR=\$CPU/mqs_quota_\$HOSTNAME;
+mkdir -p "\$PIN" || true;
+mkdir -p "\$QDIR" || true;
+root_cpus=\`cat "\$CS/cpuset.cpus" 2>/dev/null || cat /sys/devices/system/cpu/online\`;
+root_mems=\`cat "\$CS/cpuset.mems" 2>/dev/null || echo 0\`;
+echo "\$root_mems" > "\$PIN/cpuset.mems" || true;
+echo "\$root_cpus" > "\$PIN/cpuset.cpus" || true;
+if [ -w "\$PIN/cpuset.memory_migrate" ]; then echo 1 > "\$PIN/cpuset.memory_migrate" || true; fi;
+echo 100000 > "\$QDIR/cpu.cfs_period_us" || true;
+echo \$quota > "\$QDIR/cpu.cfs_quota_us" || true;
+if [ -w "\$QDIR/cpu.max" ]; then echo "\$quota 100000" > "\$QDIR/cpu.max" || true; fi;
+cs_path=\`grep :cpuset: /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
+cpu_path=\`grep -E ":(cpu|cpu,cpuacct):" /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
+mvto() { s=\$1; d=\$2; if [ ! -f "\$s/cgroup.procs" ]; then return 0; fi; if [ ! -f "\$d/cgroup.procs" ]; then return 0; fi; for p in \`cat "\$s/cgroup.procs" 2>/dev/null\`; do echo \$p > "\$d/cgroup.procs" 2>/dev/null || true; done; };
+migrate() { if [ -n "\$cs_path" ]; then mvto "\$CS\$cs_path" "\$PIN"; fi; if [ -n "\$cpu_path" ]; then mvto "\$CPU\$cpu_path" "\$QDIR"; fi; if [ -d /var/sankuai/hulk/one-cpu-config ]; then mvto /var/sankuai/hulk/one-cpu-config "\$QDIR"; fi; };
+migrate;
+( while true; do migrate; sleep 2; done ) &
+EOF
 }
 
 inject_app_entrypoint_wrap() {
@@ -2041,11 +2188,9 @@ create_pod() {
     # 否则模板残留 32 核会使实际用量超过 k8s limits.cpu
     inject_hulk_core_into_yaml "$yaml_file" "$CPU_CORES"
     if [[ -z "$NUMA_SPEC" ]]; then
-      # 无 NUMA：requests 略低于 limits → Burstable，避开 static CPU manager 独占绑核，
-      # 容器跑在整机共享 cpuset；用量由 limits + HULK_CORE + 启动写 quota 卡在 N 核。
-      local cpu_req_milli=$((CPU_CORES * 1000 - 100))
-      (( cpu_req_milli < 1 )) && cpu_req_milli=1
-      lower_app_cpu_request "$yaml_file" "${cpu_req_milli}m"
+      # 无 NUMA：保持 request=limit 整数（k8s CFS still N 核）。不降成 15900m Burstable。
+      # 通过宿主机自定义 cgroup 把进程迁出 kubelet 独占 cpuset，同时用独立 cpu quota 卡 N 核。
+      ensure_app_host_cgroup_mounts "$yaml_file"
       ensure_app_hulk_cpu_cgroup_mount "$yaml_file"
     fi
   fi
@@ -2204,8 +2349,9 @@ else
   echo "  绑定模式: 整机共享+quota 限制模式"
   echo "           无 numa 参数时：不绑定 cpuset/内存节点，容器可用整机所有 CPU 和内存，"
   if [[ -n "$CPU_CORES" ]]; then
-    echo "           app limits.cpu=${CPU_CORES}，requests.cpu=$((CPU_CORES * 1000 - 100))m → QoS Burstable，"
-    echo "           整机共享 cpuset（不独占绑核）；CFS quota + HULK_CORE=${CPU_CORES} 把用量硬限制在 ${CPU_CORES} 核；内存 ${EFFECTIVE_MEM_NONUMA}"
+    echo "           app requests.cpu=limits.cpu=${CPU_CORES}（整数）→ QoS Guaranteed；"
+    echo "           自定义 cgroup /sys/fs/cgroup/cpuset/mqs_full_cpuset = 整机 CPU，"
+    echo "           /sys/fs/cgroup/cpu/mqs_quota_<pod> CFS quota=${CPU_CORES} 核；内存 ${EFFECTIVE_MEM_NONUMA}"
   else
     echo "           CPU quota 保持模板原值（未指定 cpu_com），内存严格限制 ${EFFECTIVE_MEM_NONUMA}"
   fi
@@ -2484,10 +2630,12 @@ else
   echo "  不绑定 cpuset/内存节点：已清除 ${NUMA_CPUSET_ENV_NAME}/${NUMA_ENV_NAME} env 及对应 annotation"
   echo "  容器可用整机所有 CPU 和所有 NUMA 内存节点"
   if [[ -n "$CPU_CORES" ]]; then
-    echo "  app limits.cpu = ${CPU_CORES}，requests.cpu = $((CPU_CORES * 1000 - 100))m → Pod QoS=Burstable"
-    echo "  kubelet static CPU manager 不独占绑核，容器跑在整机共享 cpuset（taskset 应为 online 全核减去其他独占核）"
-    echo "  用量由 CFS quota + HULK_CORE/HULK_CORE_NUM=${CPU_CORES} 硬限制在 ${CPU_CORES} 核（上限 ${CPU_CORES}00%）"
-    echo "  总 Pod CPU request ≈ app(毫核) + sidecar（如 $((CPU_CORES * 1000 - 100))m+1）"
+    echo "  app requests.cpu = limits.cpu = ${CPU_CORES}（整数）→ Pod QoS=Guaranteed"
+    echo "  启动后把进程迁到 kubelet 不管的自定义 cgroup："
+    echo "    cpuset: /sys/fs/cgroup/cpuset/mqs_full_cpuset （online 全核，taskset 应为整机）"
+    echo "    cpu:    /sys/fs/cgroup/cpu/mqs_quota_<pod>     （CFS quota=${CPU_CORES} 核，上限 ${CPU_CORES}00%）"
+    echo "  内存/pids 仍留在 kubelet cgroup（cgroup v1 控制器独立）"
+    echo "  HULK_CORE/HULK_CORE_NUM=${CPU_CORES}；总 Pod CPU request ≈ app + sidecar（如 ${CPU_CORES}+1）"
   else
     echo "  CPU quota 保持模板原值（未指定 cpu_com）"
   fi
@@ -2496,21 +2644,19 @@ else
   else
     echo "  内存由 memory cgroup 严格限制 resources.limits.memory=${NONUMA_MEM_LIMIT}（默认，未指定 --mem）"
   fi
-  echo "  验证: cat /sys/fs/cgroup/cpuset/cpuset.cpus（容器内，应为整机 online CPU，而不是连续 ${CPU_CORES:-N} 核）"
-  echo "        cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us / cpu.cfs_period_us（应=cpu_com*100000 / 100000）"
-  echo "        cat /var/sankuai/hulk/one-cpu-config/cpu.cfs_quota_us（Hulk cgroup，同样应=cpu_com*100000）"
+  echo "  验证: cat /host-cgroup/cpuset/mqs_full_cpuset/cpuset.cpus   # 整机 online CPU"
+  echo "        cat /host-cgroup/cpu/mqs_quota_\$HOSTNAME/cpu.cfs_quota_us  # 应=cpu_com*100000"
+  echo "        taskset -cp <java-pid>   # 应接近整机，而不是连续 ${CPU_CORES:-N} 核"
+  echo "        cat /proc/<pid>/cgroup | grep cpuset   # 应含 mqs_full_cpuset，不是 kubepods 独占核"
   echo ""
-  echo "  ----- 整机 cpuset + ${CPU_CORES:-N} 核 quota 验证 -----"
-  echo "  # Pod QoS 应为 Burstable（不是 Guaranteed；Guaranteed 会独占绑核）:"
+  echo "  ----- 自定义 cgroup 验证 -----"
+  echo "  # QoS 仍为 Guaranteed（k8s 侧 limit=request）；绑核靠自定义 cpuset 解开"
   echo "  kubectl --kubeconfig=${KCFG} -n ${NS} get pod <pod> -o jsonpath='{.status.qosClass}'"
-  echo "  # kubelet cpu manager：Burstable Pod 不应出现在 exclusiveCPUSet 里"
-  echo "  cat /var/lib/kubelet/cpu_manager_state"
-  echo "  # 宿主机上看进程亲和性，应为整机 online CPU（减去其他 Pod 的独占核），不能是连续 ${CPU_CORES:-N} 核:"
+  echo "  # 宿主机："
+  echo "  cat /sys/fs/cgroup/cpuset/mqs_full_cpuset/cpuset.cpus"
+  echo "  cat /sys/fs/cgroup/cpuset/mqs_full_cpuset/cgroup.procs"
+  echo "  cat /sys/fs/cgroup/cpu/mqs_quota_<pod>/cpu.cfs_quota_us"
   echo "  taskset -cp <pid>"
-  echo "  # 容器内 cpuset / quota（quota 应=cpu_com*100000，cpuset 应接近整机）:"
-  echo "  cat /sys/fs/cgroup/cpuset/cpuset.cpus"
-  echo "  cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us"
-  echo "  cat /var/sankuai/hulk/one-cpu-config/cpu.cfs_quota_us"
   echo "  # 确认 hulk 核数（应为 cpu_com，不是模板 32）："
   echo "  printenv HULK_CORE HULK_CORE_NUM"
   echo ""
@@ -2522,7 +2668,7 @@ if [[ -n "$CPU_CORES" ]]; then
   echo "  app/init HULK_CORE         = ${CPU_CORES}（同步 HULK_CORE_NUM，hulk cgroup 按此严格限核）"
   echo "  与 --update-jvm 无关：只要 cpu_com=${CPU_CORES} 就会限核；未指定 event_loop 时还会注入 -XX:ActiveProcessorCount=${CPU_CORES}"
   if [[ -z "$NUMA_SPEC" ]]; then
-    echo "  app resources.requests.cpu = $((CPU_CORES * 1000 - 100))m（略低于 limits → Burstable，整机共享 cpuset；用量仍卡在 ${CPU_CORES} 核）"
+    echo "  app resources.requests.cpu = ${CPU_CORES}（与 limits 相同；整机 cpuset 靠自定义 cgroup，不靠 Burstable）"
   else
     echo "  app resources.requests.cpu = ${CPU_CORES}（与 limits 相同 → Guaranteed 的 CPU 部分）"
   fi
