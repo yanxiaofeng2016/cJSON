@@ -1636,15 +1636,9 @@ echo pid1_cgroup_ns=\$(readlink /proc/1/ns/cgroup 2>&1) >> \$LOG;
 NSENTER=;
 if [ -x /host-nsenter ]; then NSENTER=/host-nsenter; fi;
 if [ -z "\$NSENTER" ] && command -v nsenter >/dev/null 2>&1; then NSENTER=\`command -v nsenter\`; fi;
+if [ -n "\$NSENTER" ] && ! \$NSENTER -t 1 -C -- true 2>>\$LOG; then echo nsenter_probe_failed >> \$LOG; NSENTER=; fi;
 echo NSENTER=\$NSENTER >> \$LOG;
-hostcg() {
-  if [ -n "\$NSENTER" ] && [ -e /proc/1/ns/cgroup ]; then
-    \$NSENTER -t 1 -C -- /bin/sh -c "\$1"
-  else
-    echo nsenter_unavailable >> \$LOG
-    /bin/sh -c "\$1"
-  fi
-};
+hostcg() { if /bin/sh -c "\$1" 2>>\$LOG; then return 0; fi; echo direct_fail \$1 >> \$LOG; if [ -z "\$NSENTER" ]; then return 1; fi; \$NSENTER -t 1 -C -- /bin/sh -c "\$1" 2>>\$LOG; };
 HC=/host-cgroup;
 echo ls_host_cgroup=\$(ls -ld \$HC 2>&1) >> \$LOG;
 echo ls_cpuset=\$(ls \$HC/cpuset 2>&1 | tr "\\n" ,) >> \$LOG;
@@ -1656,17 +1650,25 @@ if [ ! -f "\$CPU/cgroup.procs" ]; then CPU=/sys/fs/cgroup/cpu; fi;
 PIN=\$CS/mqs_full_cpuset;
 QDIR=\$CPU/mqs_quota_\$HOSTNAME;
 echo CS=\$CS CPU=\$CPU PIN=\$PIN QDIR=\$QDIR >> \$LOG;
-hostcg "mkdir -p \$PIN; mkdir -p \$QDIR";
+hostcg "mkdir -p \$PIN"; echo mkdir_pin_rc=\$? >> \$LOG;
+hostcg "mkdir -p \$QDIR"; echo mkdir_quota_rc=\$? >> \$LOG;
 echo after_mkdir=\$(ls -ld \$PIN \$QDIR 2>&1 | tr "\\n" ,) >> \$LOG;
 root_cpus=\`cat "\$CS/cpuset.cpus" 2>/dev/null || cat /sys/devices/system/cpu/online\`;
 root_mems=\`cat "\$CS/cpuset.mems" 2>/dev/null || echo 0\`;
 echo root_cpus=\$root_cpus root_mems=\$root_mems >> \$LOG;
-hostcg "echo \$root_mems > \$PIN/cpuset.mems; echo \$root_cpus > \$PIN/cpuset.cpus; if [ -w \$PIN/cpuset.memory_migrate ]; then echo 1 > \$PIN/cpuset.memory_migrate; fi; echo 100000 > \$QDIR/cpu.cfs_period_us; echo \$quota > \$QDIR/cpu.cfs_quota_us; if [ -w \$QDIR/cpu.max ]; then echo \$quota 100000 > \$QDIR/cpu.max; fi";
+hostcg "echo \$root_mems > \$PIN/cpuset.mems"; echo write_mems_rc=\$? >> \$LOG;
+hostcg "echo \$root_cpus > \$PIN/cpuset.cpus"; echo write_cpus_rc=\$? >> \$LOG;
+hostcg "echo 100000 > \$QDIR/cpu.cfs_period_us"; echo write_period_rc=\$? >> \$LOG;
+hostcg "echo \$quota > \$QDIR/cpu.cfs_quota_us"; echo write_quota_rc=\$? >> \$LOG;
 echo after_write_cpus=\$(cat \$PIN/cpuset.cpus 2>&1) after_write_quota=\$(cat \$QDIR/cpu.cfs_quota_us 2>&1) >> \$LOG;
-cs_path=\`grep :cpuset: /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
-cpu_path=\`grep -E ":(cpu|cpu,cpuacct):" /proc/self/cgroup 2>/dev/null | head -1 | cut -d: -f3\`;
-echo cs_path=\$cs_path cpu_path=\$cpu_path >> \$LOG;
-cat /proc/self/cgroup >> \$LOG;
+myproc=/proc/self/cgroup;
+if [ -n "\$NSENTER" ]; then hostcs=\`\$NSENTER -t 1 -C -- cat /proc/\$\$/cgroup 2>/dev/null\`; if [ -n "\$hostcs" ]; then echo "\$hostcs" > /tmp/mqs-hostcgroup; myproc=/tmp/mqs-hostcgroup; fi; fi;
+cs_path=\`grep :cpuset: \$myproc 2>/dev/null | head -1 | cut -d: -f3\`;
+cpu_path=\`grep -E ":(cpu|cpu,cpuacct):" \$myproc 2>/dev/null | head -1 | cut -d: -f3\`;
+echo myproc=\$myproc cs_path=\$cs_path cpu_path=\$cpu_path >> \$LOG;
+cat \$myproc >> \$LOG;
+case \$cs_path in ""|/) echo REFUSE_root_cpuset_src >> \$LOG; cs_path= ;; esac;
+case \$cpu_path in ""|/) echo REFUSE_root_cpu_src >> \$LOG; cpu_path= ;; esac;
 mvto() { s=\$1; d=\$2; if [ ! -f "\$s/cgroup.procs" ]; then echo missing_src=\$s >> \$LOG; return 0; fi; if [ ! -f "\$d/cgroup.procs" ]; then echo missing_dst=\$d >> \$LOG; return 0; fi; for p in \`cat "\$s/cgroup.procs" 2>/dev/null\`; do hostcg "echo \$p > \$d/cgroup.procs" && echo moved \$p to \$d >> \$LOG || echo move_fail \$p to \$d >> \$LOG; done; };
 migrate() { if [ -n "\$cs_path" ]; then mvto "\$CS\$cs_path" "\$PIN"; fi; if [ -n "\$cpu_path" ]; then mvto "\$CPU\$cpu_path" "\$QDIR"; fi; if [ -d /var/sankuai/hulk/one-cpu-config ]; then mvto /var/sankuai/hulk/one-cpu-config "\$QDIR"; fi; };
 migrate;
@@ -1888,6 +1890,20 @@ WRAPEOF
       "$export_java_home" "$prefix" "$mqs_bin" "$mqs_arg")
   else
     wrap=$(printf '%s; exec %s %s' "$prefix" "$mqs_bin" "$mqs_arg")
+  fi
+
+  # wrap 会被容器 /bin/sh -c 执行；语法错误直接 CrashLoopBackOff，且日志里只有
+  # "syntax error" 很难定位。cpu_quota_shell_cmd 把多行 heredoc 压成一行，任何
+  # 缺分号的 if/case/函数定义都会在这里被抓住。
+  if ! /bin/sh -n <<< "$wrap"; then
+    echo "错误: 生成的 app entrypoint 不是合法 sh 脚本（会 CrashLoop）。" >&2
+    printf '%s\n' "$wrap" > "${yaml_file}.badwrap"
+    echo "      已写出 ${yaml_file}.badwrap 供排查" >&2
+    exit 1
+  fi
+  if [[ "$wrap" == *"'"* ]]; then
+    echo "错误: 生成的 app entrypoint 含单引号，会破坏 YAML 单引号 args。" >&2
+    exit 1
   fi
 
   # ENVIRON 传递 wrap，避免 awk -v 把 \n 等转义成真实换行、弄坏 YAML 单行 args
