@@ -94,6 +94,14 @@
 #                  NUMA / 非 NUMA 模式均可用；del/plus/add 三种模式都经 create_pod
 #                  逐 Pod 生效，无需分别适配。
 #
+# pod_namespace / --pod_namespace（可选，放任意位置）:
+#   --pod_namespace sankuai-test-its-haiguang02
+#   pod_namespace=sankuai-test-its-haiguang02
+#                  （也接受 --namespace / namespace=）
+#                  删除、查询、apply 全部走该命名空间；生成 YAML 的 metadata.namespace
+#                  也会改成这个值。省略则 NAMESPACE 环境变量，再省略则
+#                  sankuai-test-its-haiguang。
+#
 # 示例:
 #   ./scale_proxy_pods.sh 6 1341-1343                       # 增量到 6 个
 #   ./scale_proxy_pods.sh del 6 1341-1343                   # 仅删 1341-1343 上 proxy，再重建 6 个
@@ -113,6 +121,8 @@
 #   ./scale_proxy_pods.sh del 3 1341-1343                   # 默认 1.6 / 模板镜像
 #   ./scale_proxy_pods.sh del 3 1341-1343 cpu_com=16 --mem 16G   # 16C16G
 #   ./scale_proxy_pods.sh plus 3 1341-1343 numa1 cpu_com=16 --mem 16G  # NUMA 绑核 + 16G 内存
+#   ./scale_proxy_pods.sh del 3 1454 --pod_namespace sankuai-test-its-haiguang02
+#   ./scale_proxy_pods.sh del 3 1454 cpu_com=16 --app_version 1.8 --pod_namespace sankuai-test-its-haiguang02
 #
 # 删除相关环境变量（可选）:
 #   DELETE_WAIT_TIMEOUT=20    等待 Pod 终止秒数（默认 20）
@@ -187,6 +197,7 @@ JAVA_PATH=""
 UPDATE_JVM=0
 APP_VERSION=""
 APP_MEM=""
+POD_NAMESPACE=""
 # 32G 高吞吐推荐 flags（由 /tmp/jdk-wrap/bin/java 插入主类名之前，覆盖 mqs 硬编码）
 # 可选未注入: -XX:MaxDirectMemorySize=2g
 UPDATE_JVM_FLAGS='-XX:InitialRAMPercentage=75.0 -XX:MaxRAMPercentage=75.0 -XX:ParallelGCThreads=20 -XX:ConcGCThreads=5 -XX:MaxGCPauseMillis=50 -XX:+UseNUMA -Xlog:gc*=info:file=/opt/logs/mqs/gc.log:time,uptime,level,tags:filecount=5,filesize=50M'
@@ -194,6 +205,7 @@ DEFAULT_MJDK_HOME="${MQS_JDK_OVERLAY_PATH:-/usr/local/mjdk-8.0.0-312}"
 ARGS=()
 expect_app_version=0
 expect_mem=0
+expect_pod_namespace=0
 for arg in "$@"; do
   if (( expect_app_version )); then
     APP_VERSION="${arg//$'\r'/}"
@@ -203,6 +215,11 @@ for arg in "$@"; do
   if (( expect_mem )); then
     APP_MEM="${arg//$'\r'/}"
     expect_mem=0
+    continue
+  fi
+  if (( expect_pod_namespace )); then
+    POD_NAMESPACE="${arg//$'\r'/}"
+    expect_pod_namespace=0
     continue
   fi
   if [[ "$arg" =~ ^cpu_com=([0-9]+)$ ]]; then
@@ -227,6 +244,10 @@ for arg in "$@"; do
     expect_mem=1
   elif [[ "$arg" =~ ^mem=(.*)$ ]]; then
     APP_MEM="${BASH_REMATCH[1]//$'\r'/}"
+  elif [[ "$arg" == "--pod_namespace" || "$arg" == "--pod-namespace" || "$arg" == "--namespace" ]]; then
+    expect_pod_namespace=1
+  elif [[ "$arg" =~ ^(pod_namespace|pod-namespace|namespace)=(.*)$ ]]; then
+    POD_NAMESPACE="${BASH_REMATCH[2]//$'\r'/}"
   else
     ARGS+=("$arg")
   fi
@@ -239,9 +260,17 @@ if (( expect_mem )); then
   echo "错误: --mem 需要内存参数（如 16G 或 16Gi）"
   exit 1
 fi
+if (( expect_pod_namespace )); then
+  echo "错误: --pod_namespace 需要命名空间参数（如 sankuai-test-its-haiguang02）"
+  exit 1
+fi
 # 去掉意外空白，避免 "1.8 " 导致后续 == "1.8" 比较失败、inject 被跳过
 APP_VERSION="${APP_VERSION//[[:space:]]/}"
 APP_MEM="${APP_MEM//[[:space:]]/}"
+POD_NAMESPACE="${POD_NAMESPACE//[[:space:]]/}"
+if [[ -n "$POD_NAMESPACE" ]]; then
+  NS="$POD_NAMESPACE"
+fi
 
 # 解析模式：del | plus | 默认(add)
 MODE="add"
@@ -275,7 +304,7 @@ esac
 # ---------------------------------------------------------------------------
 usage() {
   cat <<'EOF'
-用法: scale_proxy_pods.sh [del|plus] <数量> <node列表> [numa列表] [cpu_com=<N>] [event_loop=<N>] [java_path=<PATH>] [--update-jvm] [--app_version <VER>] [--mem <值>]
+用法: scale_proxy_pods.sh [del|plus] <数量> <node列表> [numa列表] [cpu_com=<N>] [event_loop=<N>] [java_path=<PATH>] [--update-jvm] [--app_version <VER>] [--mem <值>] [--pod_namespace <NS>]
 
 模式:
   <数量>               增量模式：补足到目标总数（当前 < 目标才创建）
@@ -317,6 +346,9 @@ usage() {
                        sidecar/init 内存不动；裸 G/M/K/T 按口语习惯映射为 Gi/Mi/Ki/Ti
                        （如 "16C16G" 中的 16G → 16Gi，非 SI 十进制）
                        省略时行为不变：无 NUMA 保持 32Gi；有 NUMA 保持模板默认值
+  --pod_namespace <NS> 或 pod_namespace=<NS>（也接受 --namespace / namespace=）
+                       kubectl 删除/创建/查询所用的命名空间；同时写入 YAML metadata.namespace
+                       省略则用环境变量 NAMESPACE，再省略则 sankuai-test-its-haiguang
 
 node列表:
   1341-1343 | 1341,1342,1343 | 完整 nodeName
@@ -351,6 +383,8 @@ numa列表（可选）:
   ./scale_proxy_pods.sh del 3 1341-1343                   # 默认 1.6 / 模板镜像
   ./scale_proxy_pods.sh del 3 1341-1343 cpu_com=16 --mem 16G   # 16C16G
   ./scale_proxy_pods.sh plus 3 1341-1343 numa1 cpu_com=16 --mem 16G  # NUMA 绑核 + 16G 内存
+  ./scale_proxy_pods.sh del 3 1454 --pod_namespace sankuai-test-its-haiguang02
+  ./scale_proxy_pods.sh del 3 1454 cpu_com=16 --app_version 1.8 --pod_namespace sankuai-test-its-haiguang02
 
 删除环境变量（可选）:
   DELETE_WAIT_TIMEOUT=20   等待终止秒数（默认 20）
@@ -365,7 +399,16 @@ EOF
 # ---------------------------------------------------------------------------
 [[ -n "$COUNT" && "$COUNT" =~ ^[0-9]+$ && "$COUNT" -gt 0 ]] || usage
 [[ -n "$NODE_SPEC" ]] || usage
+if [[ ! "$NS" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ || ${#NS} -gt 63 ]]; then
+  echo "错误: 非法命名空间: ${NS}（需符合 k8s DNS-1123 label，最长 63）"
+  exit 1
+fi
 [[ -f "$KCFG" ]] || { echo "错误: 找不到 kubeconfig: $KCFG"; exit 1; }
+if ! kubectl --kubeconfig="$KCFG" get namespace "$NS" >/dev/null 2>&1; then
+  echo "错误: 命名空间不存在或无权访问: ${NS}"
+  echo "      kubectl --kubeconfig=${KCFG} get ns ${NS}"
+  exit 1
+fi
 [[ -f "$TEMPLATE" ]] || { echo "错误: 找不到模板 YAML: $TEMPLATE"; exit 1; }
 [[ -z "$CPU_CORES" || "$CPU_CORES" -gt 0 ]] || { echo "错误: cpu_com 必须为正整数"; exit 1; }
 [[ -z "$EVENT_LOOPS" || "$EVENT_LOOPS" -gt 0 ]] || { echo "错误: event_loop 必须为正整数"; exit 1; }
@@ -391,6 +434,26 @@ EFFECTIVE_MEM_NONUMA="${APP_MEM:-$NONUMA_MEM_LIMIT}"
 # ---------------------------------------------------------------------------
 kubectl_cmd() {
   kubectl --kubeconfig="$KCFG" -n "$NS" "$@"
+}
+
+# 把模板里的 metadata.namespace 改成当前 NS，避免 apply 进默认/模板命名空间。
+inject_namespace_into_yaml() {
+  local yaml_file="$1"
+  local ns="$2"
+  local tmp_file="${yaml_file}.ns.tmp"
+  if grep -qE '^  namespace:' "$yaml_file"; then
+    sed -i -E "s/^  namespace:.*/  namespace: ${ns}/" "$yaml_file"
+    return 0
+  fi
+  awk -v ns="$ns" '
+    /^  name:/ && !done {
+      print
+      print "  namespace: " ns
+      done = 1
+      next
+    }
+    { print }
+  ' "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
 }
 
 # 收集指定 node 上匹配 LABEL_SELECTOR 的 proxy Pod 名（空格分隔）
@@ -2405,6 +2468,7 @@ create_pod() {
   sed -e "s/^  name: .*/  name: ${pod_name}/" \
       -e "s/^  nodeName: .*/  nodeName: ${node}/" \
       "$TEMPLATE" > "$yaml_file"
+  inject_namespace_into_yaml "$yaml_file" "$NS"
 
   if [[ -n "$NUMA_SPEC" ]]; then
     inject_numa_into_yaml "$yaml_file" "$numa_id" "$cpuset"
@@ -2608,6 +2672,7 @@ fi
 # 打印配置概览
 # ---------------------------------------------------------------------------
 echo "===== MQS Proxy Pod 创建器 ====="
+echo "  命名空间: ${NS}"
 case "$MODE" in
   del)  echo "  模式: del（删除指定 node 列表上的 proxy Pod，重建 ${COUNT} 个）" ;;
   plus) echo "  模式: plus（在现有 Pod 基础上额外追加 ${COUNT} 个）" ;;
