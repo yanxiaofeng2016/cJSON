@@ -456,6 +456,54 @@ inject_namespace_into_yaml() {
   ' "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
 }
 
+# 模板从其它 ns 拷出来时会写死 default-token-<suffix>。该 Secret 只在原 ns 存在，
+# 换 ns 后 kubelet FailedMount，init 一直 PodInitializing。
+lookup_sa_token_secret() {
+  local ns="$1"
+  local sa="${2:-default}"
+  local name="" token
+  name=$(kubectl --kubeconfig="$KCFG" -n "$ns" get sa "$sa" \
+    -o jsonpath='{.secrets[0].name}' 2>/dev/null || true)
+  if [[ -n "$name" ]]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  for token in $(kubectl --kubeconfig="$KCFG" -n "$ns" get secret \
+      --field-selector type=kubernetes.io/service-account-token \
+      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true); do
+    name=$(kubectl --kubeconfig="$KCFG" -n "$ns" get secret "$token" \
+      -o jsonpath='{.metadata.annotations.kubernetes\.io/service-account\.name}' 2>/dev/null || true)
+    if [[ "$name" == "$sa" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  done
+  return 1
+}
+
+rewrite_sa_token_for_namespace() {
+  local yaml_file="$1"
+  local ns="$2"
+  local sa old_token new_token
+  sa=$(awk '/^[[:space:]]*serviceAccountName:/{print $2; exit}' "$yaml_file")
+  [[ -z "$sa" ]] && sa=$(awk '/^[[:space:]]*serviceAccount:/{print $2; exit}' "$yaml_file")
+  sa="${sa:-default}"
+  old_token=$(grep -oE 'default-token-[a-z0-9]+' "$yaml_file" | head -1 || true)
+  [[ -z "$old_token" ]] && return 0
+  if ! new_token=$(lookup_sa_token_secret "$ns" "$sa"); then
+    echo "错误: 命名空间 ${ns} 的 ServiceAccount ${sa} 没有 token Secret。" >&2
+    echo "      模板写死了 ${old_token}（来自原 ns），kubelet 会 FailedMount，init 一直 Init:0/1。" >&2
+    echo "      请检查: kubectl --kubeconfig=${KCFG} -n ${ns} get sa ${sa} -o yaml" >&2
+    echo "              kubectl --kubeconfig=${KCFG} -n ${ns} get secret | grep token" >&2
+    exit 1
+  fi
+  if [[ "$old_token" == "$new_token" ]]; then
+    return 0
+  fi
+  sed -i "s/${old_token}/${new_token}/g" "$yaml_file"
+  echo "  SA token: ${old_token} -> ${new_token} (ns=${ns} sa=${sa})"
+}
+
 # 收集指定 node 上匹配 LABEL_SELECTOR 的 proxy Pod 名（空格分隔）
 collect_proxy_pods_on_nodes() {
   local node names all=""
@@ -2469,6 +2517,7 @@ create_pod() {
       -e "s/^  nodeName: .*/  nodeName: ${node}/" \
       "$TEMPLATE" > "$yaml_file"
   inject_namespace_into_yaml "$yaml_file" "$NS"
+  rewrite_sa_token_for_namespace "$yaml_file" "$NS"
 
   if [[ -n "$NUMA_SPEC" ]]; then
     inject_numa_into_yaml "$yaml_file" "$numa_id" "$cpuset"
