@@ -1909,18 +1909,24 @@ host_migrate_local_proxy_pods() {
             -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' 2>/dev/null)
 }
 
+host_stop_mqs_cgroup_keeper() {
+  local pidfile="/tmp/mqs-cgroup-keep.pid"
+  local old
+  [[ -f "$pidfile" ]] || return 0
+  old=$(cat "$pidfile" 2>/dev/null || true)
+  if [[ "$old" =~ ^[1-9][0-9]*$ ]] && kill -0 "$old" 2>/dev/null; then
+    kill "$old" 2>/dev/null || true
+    sleep 0.2
+    echo "  已停止本机 mqs-cgroup-keep (pid=$old)，避免把 NUMA 绑核再拉成 0-255"
+  fi
+  rm -f "$pidfile"
+}
+
 host_start_mqs_cgroup_keeper() {
   local pidfile="/tmp/mqs-cgroup-keep.pid"
   local logfile="/tmp/mqs-cgroup-keep.log"
   [[ -f /sys/fs/cgroup/cpuset/mqs_full_cpuset/cgroup.procs ]] || return 0
-  if [[ -f "$pidfile" ]]; then
-    local old
-    old=$(cat "$pidfile" 2>/dev/null || true)
-    if [[ "$old" =~ ^[1-9][0-9]*$ ]] && kill -0 "$old" 2>/dev/null; then
-      kill "$old" 2>/dev/null || true
-      sleep 0.2
-    fi
-  fi
+  host_stop_mqs_cgroup_keeper
   # keeper 必须能看到本脚本的函数；把迁移逻辑写成独立脚本更稳
   nohup bash -c '
     pin=/sys/fs/cgroup/cpuset/mqs_full_cpuset
@@ -2947,7 +2953,10 @@ fi
 # ---------------------------------------------------------------------------
 declare -a NEW_PODS=()
 
-if [[ -z "$NUMA_SPEC" && -n "$CPU_CORES" ]]; then
+if [[ -n "$NUMA_SPEC" ]]; then
+  echo "===== NUMA 绑定模式：停止本机整机 cpuset keeper ====="
+  host_stop_mqs_cgroup_keeper
+elif [[ -n "$CPU_CORES" ]]; then
   echo "===== 本机预创建自定义 cgroup ====="
   host_ensure_mqs_full_cpuset
 fi
