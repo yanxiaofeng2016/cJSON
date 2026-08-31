@@ -1887,6 +1887,65 @@ host_move_pid_cgroup() {
   fi
 }
 
+host_unpin_remote_nodes() {
+  local this_host this_short script_dir unpin_src pod node_name cid pid extra=""
+  this_host=$(hostname -f 2>/dev/null || hostname)
+  this_short=$(hostname -s 2>/dev/null || hostname)
+  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  unpin_src="${script_dir}/mqs_unpin_cpuset.sh"
+  if [[ ! -f "$unpin_src" ]]; then
+    echo "提示: 同目录没有 mqs_unpin_cpuset.sh，跳过远程 unpin（1342/1343 仍会保持独占核）"
+    echo "      请把 mqs_unpin_cpuset.sh 和 scale_proxy_pods.sh 放一起，或到各 node 手工跑"
+    return 0
+  fi
+  extra="-q ${CPU_CORES}"
+  if [[ "${MQS_UNPIN_MEMORY:-0}" == "1" ]]; then
+    extra+=" -m"
+    echo "  MQS_UNPIN_MEMORY=1：远程还会打散已有 NUMA 页面（Java 会停几秒到几十秒）"
+  fi
+  while read -r pod node_name; do
+    [[ -n "$pod" && -n "$node_name" ]] || continue
+    if [[ "$node_name" == "$this_host" || "$node_name" == "$(hostname)" || "$node_name" == "$this_short" ]]; then
+      continue
+    fi
+    cid=$(kubectl_cmd get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}{.name}{" "}{.containerID}{"\n"}{end}' 2>/dev/null | awk '$1=="app"{print $2; exit}')
+    cid="${cid#*://}"
+    cid="${cid:0:64}"
+    echo "  远程 ${pod} @ ${node_name} cid=${cid:-empty}"
+    if [[ -z "$cid" ]]; then
+      continue
+    fi
+    if ! scp -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+        "$unpin_src" "root@${node_name}:/tmp/mqs_unpin_cpuset.sh" >/dev/null; then
+      echo "    scp 失败，请到 ${node_name} 手工: bash mqs_unpin_cpuset.sh ${extra} <java-pid>"
+      continue
+    fi
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+      "root@${node_name}" "bash -s" <<EOF || echo "    ssh unpin 失败: ${node_name}"
+set -e
+cid='$cid'
+pid=""
+if command -v docker >/dev/null 2>&1; then
+  pid=\$(docker inspect -f '{{.State.Pid}}' "\$cid" 2>/dev/null || true)
+fi
+if [[ -z "\$pid" || "\$pid" == "0" ]] && command -v crictl >/dev/null 2>&1; then
+  pid=\$(crictl inspect "\$cid" 2>/dev/null | awk -F '[^0-9]+' '/"pid":/ { print \$2; exit }')
+fi
+if [[ -z "\$pid" || "\$pid" == "0" ]]; then
+  echo "    未解析到 pid cid=\$cid"
+  exit 1
+fi
+chmod +x /tmp/mqs_unpin_cpuset.sh
+bash /tmp/mqs_unpin_cpuset.sh $extra "\$pid"
+# Hulk 可能把 affinity 钉回去，后台循环纠正 CPU（不重复迁内存）
+nohup bash /tmp/mqs_unpin_cpuset.sh -q ${CPU_CORES} -l "\$pid" >/tmp/mqs-unpin-loop.log 2>&1 &
+echo \$! > /tmp/mqs-unpin-loop.pid
+echo "    已 unpin pid=\$pid，后台 loop pid=\$(cat /tmp/mqs-unpin-loop.pid)"
+EOF
+  done < <(kubectl_cmd get pods -l "$LABEL_SELECTOR" --field-selector="status.phase=Running" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' 2>/dev/null)
+}
+
 host_migrate_local_proxy_pods() {
   local this_host pin pod cid pid node_name
   pin="/sys/fs/cgroup/cpuset/mqs_full_cpuset"
@@ -2999,6 +3058,8 @@ if (( END_K >= START_K )); then
     echo "===== 本机把 Ready 的 proxy 迁入 mqs_full_cpuset ====="
     host_migrate_local_proxy_pods
     host_start_mqs_cgroup_keeper
+    echo "===== 远程 node 执行 mqs_unpin_cpuset.sh（需要 1341 ssh 到 1342/1343）====="
+    host_unpin_remote_nodes
   fi
 fi
 
