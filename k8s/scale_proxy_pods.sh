@@ -2,12 +2,13 @@
 # 按 Pod 数 + Node 列表 + NUMA 列表创建 proxy Pod
 #
 # 用法:
-#   ./scale_proxy_pods.sh [del|plus] <数量> <node列表> [numa列表] [cpu_com=<N>] [event_loop=<N>] [java_path=<PATH>] [--update-jvm] [--app_version <VER>] [--mem <值>]
+#   ./scale_proxy_pods.sh [del|plus|update] <数量> <node列表> [numa列表] [cpu_com=<N>] [event_loop=<N>] [java_path=<PATH>] [--update-jvm] [--app_version <VER>] [--mem <值>] [--pod_namespace <NS>]
 #
 # 模式说明:
 #   <数量> <node列表>           增量模式：当前 Pod 数 < 数量 时才补足到目标数
-#   del  <数量> <node列表>      删重建：删除指定 node 列表上的 proxy Pod，再重建
-#   plus <数量> <node列表>      追加模式：在现有 Pod 基础上再额外新增指定数量
+#   del    <数量> <node列表>    删重建：删除指定 node 列表上的 proxy Pod，再重建
+#   plus   <数量> <node列表>    追加模式：在现有 Pod 基础上再额外新增指定数量
+#   update <数量> <node列表>    等价 del：按本次参数（cpu/numa/java_path/jvm 等）删后重建
 #
 # cpu_com 参数（可选，放任意位置）:
 #   cpu_com=16     仅改 app（第一个 container）的 resources.limits/requests.cpu=16
@@ -123,6 +124,8 @@
 #   ./scale_proxy_pods.sh plus 3 1341-1343 numa1 cpu_com=16 --mem 16G  # NUMA 绑核 + 16G 内存
 #   ./scale_proxy_pods.sh del 3 1454 --pod_namespace sankuai-test-its-haiguang02
 #   ./scale_proxy_pods.sh del 3 1454 cpu_com=16 --app_version 1.8 --pod_namespace sankuai-test-its-haiguang02
+#   ./scale_proxy_pods.sh update 3 1341-1343 cpu_com=16 numa0 --app_version 1.8 --update-jvm \
+#       java_path=/home/test/Hygon_Performance_Enhanced_BETA_linux_x64
 #
 # 删除相关环境变量（可选）:
 #   DELETE_WAIT_TIMEOUT=20    等待 Pod 终止秒数（默认 20）
@@ -272,7 +275,7 @@ if [[ -n "$POD_NAMESPACE" ]]; then
   NS="$POD_NAMESPACE"
 fi
 
-# 解析模式：del | plus | 默认(add)
+# 解析模式：del | plus | update | 默认(add)
 MODE="add"
 COUNT=""
 NODE_SPEC=""
@@ -281,6 +284,13 @@ NUMA_SPEC=""
 case "${ARGS[0]:-}" in
   del)
     MODE="del"
+    COUNT="${ARGS[1]:-}"
+    NODE_SPEC="${ARGS[2]:-}"
+    NUMA_SPEC="${ARGS[3]:-}"
+    ;;
+  update)
+    # 裸 Pod 不能 kubectl apply 原地改 command/env；update = 删掉再按新参数创建
+    MODE="update"
     COUNT="${ARGS[1]:-}"
     NODE_SPEC="${ARGS[2]:-}"
     NUMA_SPEC="${ARGS[3]:-}"
@@ -304,12 +314,13 @@ esac
 # ---------------------------------------------------------------------------
 usage() {
   cat <<'EOF'
-用法: scale_proxy_pods.sh [del|plus] <数量> <node列表> [numa列表] [cpu_com=<N>] [event_loop=<N>] [java_path=<PATH>] [--update-jvm] [--app_version <VER>] [--mem <值>] [--pod_namespace <NS>]
+用法: scale_proxy_pods.sh [del|plus|update] <数量> <node列表> [numa列表] [cpu_com=<N>] [event_loop=<N>] [java_path=<PATH>] [--update-jvm] [--app_version <VER>] [--mem <值>] [--pod_namespace <NS>]
 
 模式:
   <数量>               增量模式：补足到目标总数（当前 < 目标才创建）
   del  <数量>          删重建：删除指定 node 列表上的 proxy Pod，再重建 <数量> 个
   plus <数量>          追加：在现有 Pod 基础上额外增加 <数量> 个
+  update <数量>        等价 del：按本次参数删掉再建（改 java_path/jvm/cpu/numa 必须重建）
 
 可选参数（任意位置）:
   cpu_com=<N>          仅设置 app（第一个 container）的 CPU 核数；sidecar/init 保持模板原值
@@ -385,6 +396,7 @@ numa列表（可选）:
   ./scale_proxy_pods.sh plus 3 1341-1343 numa1 cpu_com=16 --mem 16G  # NUMA 绑核 + 16G 内存
   ./scale_proxy_pods.sh del 3 1454 --pod_namespace sankuai-test-its-haiguang02
   ./scale_proxy_pods.sh del 3 1454 cpu_com=16 --app_version 1.8 --pod_namespace sankuai-test-its-haiguang02
+  ./scale_proxy_pods.sh update 3 1341-1343 cpu_com=16 numa0 --app_version 1.8 --update-jvm java_path=/home/test/Hygon_Performance_Enhanced_BETA_linux_x64
 
 删除环境变量（可选）:
   DELETE_WAIT_TIMEOUT=20   等待终止秒数（默认 20）
@@ -1986,9 +1998,12 @@ host_start_mqs_cgroup_keeper() {
   local logfile="/tmp/mqs-cgroup-keep.log"
   [[ -f /sys/fs/cgroup/cpuset/mqs_full_cpuset/cgroup.procs ]] || return 0
   host_stop_mqs_cgroup_keeper
-  # keeper 必须能看到本脚本的函数；把迁移逻辑写成独立脚本更稳
-  nohup bash -c '
+  # quota 必须写进 keeper：只把进程迁到整机 cpuset 而不卡 CFS，实际会超过 cpu_com
+  local q=$(( CPU_CORES * 100000 ))
+  nohup env MQS_CFS_QUOTA="$q" bash -c '
     pin=/sys/fs/cgroup/cpuset/mqs_full_cpuset
+    cpu_root=/sys/fs/cgroup/cpu
+    quota=${MQS_CFS_QUOTA:-1600000}
     while true; do
       if [[ -f $pin/cgroup.procs ]]; then
         allcpus=$(cat $pin/cpuset.cpus 2>/dev/null)
@@ -1999,16 +2014,27 @@ host_start_mqs_cgroup_keeper() {
               [[ -n $p && -d /proc/$p ]] || continue
               cmd=$(tr "\0" " " < /proc/$p/cmdline 2>/dev/null || true)
               case $cmd in
-                *mqs*proxy*|*meituan/apps/mqs*) echo $p > $pin/cgroup.procs 2>/dev/null ;;
+                *mqs*proxy*|*meituan/apps/mqs*)
+                  echo $p > $pin/cgroup.procs 2>/dev/null
+                  qdir=$cpu_root/mqs_quota_$p
+                  mkdir -p "$qdir" 2>/dev/null || true
+                  echo 100000 > "$qdir/cpu.cfs_period_us" 2>/dev/null || true
+                  echo $quota > "$qdir/cpu.cfs_quota_us" 2>/dev/null || true
+                  echo $p > "$qdir/cgroup.procs" 2>/dev/null || true
+                  ;;
               esac
             done < "$f"
           done
         done
-        # 迁进 cpuset 只在 attach 那一刻重置 affinity；Hulk 之后再调
-        # sched_setaffinity 就又会把进程钉回 16 核，所以要持续纠正
         if [[ -n $allcpus ]]; then
           while read -r p; do
             [[ -n $p && -d /proc/$p ]] || continue
+            qdir=$cpu_root/mqs_quota_$p
+            if [[ -f $qdir/cgroup.procs ]]; then
+              echo 100000 > "$qdir/cpu.cfs_period_us" 2>/dev/null || true
+              echo $quota > "$qdir/cpu.cfs_quota_us" 2>/dev/null || true
+              echo $p > "$qdir/cgroup.procs" 2>/dev/null || true
+            fi
             cur=$(taskset -cp "$p" 2>/dev/null | cut -d: -f2 | tr -d " ")
             [[ -n $cur && $cur != "$allcpus" ]] && taskset -acp "$allcpus" "$p" >/dev/null 2>&1
           done < $pin/cgroup.procs
@@ -2788,9 +2814,10 @@ fi
 echo "===== MQS Proxy Pod 创建器 ====="
 echo "  命名空间: ${NS}"
 case "$MODE" in
-  del)  echo "  模式: del（删除指定 node 列表上的 proxy Pod，重建 ${COUNT} 个）" ;;
-  plus) echo "  模式: plus（在现有 Pod 基础上额外追加 ${COUNT} 个）" ;;
-  add)  echo "  模式: add（增量：补足到目标总数 ${COUNT} 个）" ;;
+  del)    echo "  模式: del（删除指定 node 列表上的 proxy Pod，重建 ${COUNT} 个）" ;;
+  update) echo "  模式: update（等价 del：按本次参数删除后重建 ${COUNT} 个）" ;;
+  plus)   echo "  模式: plus（在现有 Pod 基础上额外追加 ${COUNT} 个）" ;;
+  add)    echo "  模式: add（增量：补足到目标总数 ${COUNT} 个）" ;;
 esac
 if [[ -n "$NUMA_SPEC" ]]; then
   echo "  绑定模式: NUMA 绑定模式（cpuset + 内存节点绑定，注入 ${NUMA_CPUSET_ENV_NAME} 等）"
@@ -2900,7 +2927,7 @@ echo "当前 proxy 总数: ${total_current}"
 
 # 计算本次实际创建的起始序号和终止序号
 case "$MODE" in
-  del)
+  del|update)
     # NODES[] 已在上方解析完成，此处仅删这些 node 上的 proxy
     delete_proxy_pods_on_nodes
     START_K=1
