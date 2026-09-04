@@ -117,6 +117,7 @@
 #   ./scale_proxy_pods.sh del 3 1341-1343 java_path=/home/test/HPEJDK_1.0.0_linux_x64/
 #   ./scale_proxy_pods.sh del 3 1341-1343 --update-jvm
 #   ./scale_proxy_pods.sh del 3 1341-1343 java_path=/home/test/HPEJDK... --update-jvm cpu_com=16 numa1
+#                                                          # 有 NUMA：只换 JDK/JVM flags，不迁 mqs_full_cpuset
 #   ./scale_proxy_pods.sh del 3 1341-1343 cpu_com=16 --app_version 1.8
 #   ./scale_proxy_pods.sh plus 3 1341-1343 numa1 cpu_com=16 --app_version 1.8
 #   ./scale_proxy_pods.sh del 3 1341-1343                   # 默认 1.6 / 模板镜像
@@ -2059,7 +2060,10 @@ inject_app_entrypoint_wrap() {
   local logs="mkdir -p /opt/logs/mqs; chmod 777 /opt/logs/mqs; touch /opt/logs/mqs/gc.log"
   local prefix="$logs"
   local wrap
-  if [[ -n "$CPU_CORES" ]]; then
+  # 仅「无 NUMA + cpu_com」才迁到 mqs_full_cpuset / mqs_quota_*。
+  # 有 NUMA 时 Hulk 按 HULK_CPUSET 绑核；再跑 cpu_quota_shell_cmd 会把进程
+  # 迁到整机 0-255，把 numa0/numa1 绑核冲掉（java_path/--update-jvm 也会走本函数）。
+  if [[ -n "$CPU_CORES" && -z "$NUMA_SPEC" ]]; then
     # 配额命令以 & 结尾启动后台刷新；必须用空格拼接，禁止 "; mkdir"（&; 会 CrashLoop）
     prefix="$(cpu_quota_shell_cmd "$CPU_CORES") ${logs}"
   fi
@@ -2664,8 +2668,9 @@ create_pod() {
     inject_java_path_into_yaml "$yaml_file" "$JAVA_PATH"
   elif (( UPDATE_JVM )); then
     inject_update_jvm_into_yaml "$yaml_file"
-  elif [[ -n "$CPU_CORES" ]]; then
-    # 无 java_path / --update-jvm 时也要包装 entrypoint，才能在启动时写入 cfs quota
+  elif [[ -z "$NUMA_SPEC" && -n "$CPU_CORES" ]]; then
+    # 无 java_path / --update-jvm 时也要包装 entrypoint，才能在启动时写入 cfs quota。
+    # 有 NUMA 时不要包装：cpu_quota_shell_cmd 会 unpin 到整机 cpuset。
     inject_app_entrypoint_wrap "$yaml_file" "" "" 0
   fi
 
